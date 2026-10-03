@@ -1,0 +1,5 @@
+work/
+dist/
+*.o
+__pycache__/
+valve/

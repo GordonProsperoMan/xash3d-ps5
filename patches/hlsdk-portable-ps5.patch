@@ -1,0 +1,446 @@
+diff --git a/cl_dll/view.cpp b/cl_dll/view.cpp
+index 3b3187d..40d9d8b 100644
+--- a/cl_dll/view.cpp
++++ b/cl_dll/view.cpp
+@@ -1591,9 +1591,22 @@ V_PunchAxis
+ Client side punch effect
+ =============
+ */
++#include "mobility_int.h"
++extern mobile_engfuncs_t *gMobileEngfuncs;
++
+ void V_PunchAxis( int axis, float punch )
+ {
+ 	g_ev_punchangle[axis] = punch;
++
++	// controller rumble on weapon kick (gun recoil is reported as a view punch)
++	if( gMobileEngfuncs && axis == 0 && punch != 0.0f )
++	{
++		float strength = fabs( punch );
++		float ms = 40.0f + strength * 12.0f; // pistol ~65 ms, shotgun/357 ~160 ms
++		if( ms > 220.0f )
++			ms = 220.0f;
++		gMobileEngfuncs->pfnVibrate( ms, 0 );
++	}
+ }
+ 
+ /*
+diff --git a/scripts/ps5-hide-internal-symbols.map b/scripts/ps5-hide-internal-symbols.map
+new file mode 100644
+index 0000000..7e1b64f
+--- /dev/null
++++ b/scripts/ps5-hide-internal-symbols.map
+@@ -0,0 +1,16 @@
++/* PS5 homebrew packaging link helper.
++ *
++ * Mesa/libglapi (vendored via ps5-opengl's libPS5OpenGL.a) emits a handful
++ * of internal TLS-wrapper symbols (mangled as _ZTH*, e.g.
++ * _ZTH23_mesa_glapi_tls_Context) into the dynamic symbol table even on a
++ * final executable, not just a shared object. They have no legitimate
++ * external caller and -Wl,--exclude-libs=ALL does not catch them (they
++ * aren't plain exported library symbols, they're compiler-generated TLS
++ * init wrappers), so the PS5 native packaging tool
++ * (ps5-native-tool/sce_module_writer.cpp) refuses to link because no
++ * public SDK stub can "provide" them. Force them local explicitly.
++ */
++{
++	local:
++		_ZTH*;
++};
+diff --git a/scripts/waifulib/xcompile.py b/scripts/waifulib/xcompile.py
+index 548a64d..ec76f31 100644
+--- a/scripts/waifulib/xcompile.py
++++ b/scripts/waifulib/xcompile.py
+@@ -20,11 +20,12 @@ import os
+ import sys
+ 
+ ANDROID_NDK_ENVVARS = ['ANDROID_NDK_HOME', 'ANDROID_NDK']
+-ANDROID_NDK_SUPPORTED = [10, 19, 20, 23, 25, 27, 28]
++ANDROID_NDK_SUPPORTED = [10, 19, 20, 23, 25, 27, 28, 29, 30]
+ ANDROID_NDK_HARDFP_MAX = 11 # latest version that supports hardfp
+ ANDROID_NDK_GCC_MAX = 17 # latest NDK that ships with GCC
+ ANDROID_NDK_UNIFIED_SYSROOT_MIN = 15
+ ANDROID_NDK_SYSROOT_FLAG_MAX = 19 # latest NDK that need --sysroot flag
++ANDROID_NDK_BUGGED_LINKER_MAX = 22
+ ANDROID_NDK_API_MIN = {
+ 	10: 3,
+ 	19: 16,
+@@ -33,6 +34,8 @@ ANDROID_NDK_API_MIN = {
+ 	25: 19,
+ 	27: 19,
+ 	28: 21,
++	29: 21,
++	30: 21,
+ } # minimal API level ndk revision supports
+ 
+ ANDROID_STPCPY_API_MIN = 21 # stpcpy() introduced in SDK 21
+@@ -42,6 +45,36 @@ NSWITCH_ENVVARS = ['DEVKITPRO']
+ 
+ PSVITA_ENVVARS = ['VITASDK']
+ 
++PSP_ENVVARS = ['PSPDEV', 'PSPSDK', 'PSPTOOLCHAIN']
++
++class iOS:
++	ctx = None
++	sdkpath = None
++	target = None
++	
++	def __init__(self, ctx, issim):
++		self.ctx = ctx
++		sdk = 'iphonesimulator' if issim else 'iphoneos'
++		self.sdkpath = ctx.cmd_and_log('xcrun --show-sdk-path --sdk %s' % sdk).strip()
++		self.target = '--target=aarch64-apple-ios'
++		if issim: self.target += '-simulator'
++	
++	def cflags(self, cxx = False):
++	
++		cflags = [ '-isysroot' + self.sdkpath, self.target, '-mios-version-min=12.0' ]
++		return cflags
++		
++	def linkflags(self):
++		
++		linkflags = [ '-isysroot' + self.sdkpath, self.target, '-mios-version-min=12.0' ]
++		return linkflags
++	
++	def cc(self):
++		return 'clang'
++
++	def cxx(self):
++		return 'clang++'
++
+ # This class does support ONLY r10e and r19c/r20 NDK
+ class Android:
+ 	ctx            = None # waf context
+@@ -299,8 +332,10 @@ class Android:
+ 					'-isystem', '%s/usr/include/' % (self.sysroot())
+ 				]
+ 
+-		cflags += ['-I%s' % (self.system_stl())]
++		# only use provided STL implementations with GCC-based NDKs
++		# newer Clang based do everything we need automatically
+ 		if not self.is_clang():
++			cflags += ['-I%s' % (self.system_stl())]
+ 			cflags += ['-DANDROID', '-D__ANDROID__']
+ 
+ 		if cxx and not self.is_clang() and self.toolchain not in ['4.8','4.9']:
+@@ -354,6 +389,12 @@ class Android:
+ 		else: linkflags += ['-no-canonical-prefixes']
+ 
+ 		linkflags += ['-Wl,--hash-style=sysv', '-Wl,--no-undefined']
++
++		linkflags += ["-Wl,-z,max-page-size=16384"]
++
++		if self.ndk_rev <= ANDROID_NDK_BUGGED_LINKER_MAX:
++			linkflags += ["-Wl,-z,common-page-size=16384"]
++
+ 		return linkflags
+ 
+ 	def ldflags(self):
+@@ -519,12 +560,159 @@ class PSVita:
+ 		linkflags = ['-Wl,--hash-style=sysv', '-Wl,-q', '-Wl,-z,nocopyreloc', '-mtune=cortex-a9', '-mfpu=neon']
+ 		# enforce no-short-enums again
+ 		linkflags += ['-Wl,-no-enum-size-warning', '-fno-short-enums']
++		# vitasdk's ld script reserves __sce_headroom bytes after the RX segment for the SCE metadata that vita-elf-create appends there,
++		# otherwise "Cannot allocate N bytes for SCE data at end of segment 0; segment 1 overlaps" depends on the layout, see vitasdk/buildscripts#144
++		linkflags += ['-Wl,-z,max-page-size=0x10000', '-Wl,--defsym,__sce_headroom=0x10000']
++		return linkflags
++
++	def ldflags(self):
++		ldflags = []
++		return ldflags
++
++class PS5:
++	# PS5 homebrew, built on the ps5-payload-dev/sdk clang/lld toolchain,
++	# linking against blackbearreloaded/ps5-opengl's static SDK for its
++	# EGL/GL headers and its SDL2 "G19" video driver integration.
++	#
++	# PS5_PAYLOAD_SDK  -> ps5-payload-sdk install root (has toolchain/prospero.mk)
++	# PS5_OPENGL_SDK   -> ps5-opengl's build/sdk/ps5-opengl-gl46 (relocatable package)
++	ctx              = None
++	payload_sdk_dir  = None
++	opengl_sdk_dir   = None
++
++	def __init__(self, ctx):
++		self.ctx = ctx
++
++		self.payload_sdk_dir = os.getenv('PS5_PAYLOAD_SDK')
++		if self.payload_sdk_dir is None:
++			ctx.fatal('Set PS5_PAYLOAD_SDK environment variable pointing to the installed ps5-payload-sdk directory!')
++
++		self.opengl_sdk_dir = os.getenv('PS5_OPENGL_SDK')
++		if self.opengl_sdk_dir is None:
++			ctx.fatal('Set PS5_OPENGL_SDK environment variable pointing to the built ps5-opengl-gl46 SDK directory!')
++
++	def gen_toolchain_prefix(self):
++		# ps5-payload-sdk wraps clang/lld rather than shipping a traditional
++		# target-prefixed binutils triplet; the wrapper scripts live in
++		# $PS5_PAYLOAD_SDK/bin.
++		return os.path.join(self.payload_sdk_dir, 'bin', 'prospero-')
++
++	def cc(self):
++		return self.gen_toolchain_prefix() + 'clang'
++
++	def cxx(self):
++		return self.gen_toolchain_prefix() + 'clang++'
++
++	def strip(self):
++		return self.gen_toolchain_prefix() + 'strip'
++
++	def ar(self):
++		return self.gen_toolchain_prefix() + 'ar'
++
++	def pkgconfig(self):
++		return 'pkg-config' # host pkg-config, pointed at PKG_CONFIG_PATH by the caller
++
++	def cflags(self, cxx = False):
++		cflags = []
++		cflags += ['-DXASH_PS5=1']
++		# NOTE: deliberately not adding -isystem .../target/include here:
++		# prospero-clang/prospero-clang++ already configure that path (and
++		# the matching c++/v1 headers, in the correct libc++-first order)
++		# via their own built-in -isysroot. Redeclaring it via an explicit
++		# -isystem flag inserts it ahead of the compiler's internal c++/v1
++		# search path and breaks libc++ header resolution for C++ sources
++		# (clang's "<cstdint> tried including <stdint.h> but didn't find
++		# libc++'s <stdint.h> header" class of errors).
++		cflags += ['-I', os.path.join(self.opengl_sdk_dir, 'include')]
++		return cflags
++
++	def linkflags(self):
++		linkflags = []
++		linkflags += ['-L', os.path.join(self.payload_sdk_dir, 'target', 'lib')]
++		linkflags += ['-L', os.path.join(self.opengl_sdk_dir, 'lib')]
++		# Mesa/libglapi internals (e.g. its TLS context wrapper symbol) leak
++		# into the dynamic symbol table otherwise, which the PS5 packaging
++		# tool then insists on resolving against a public SDK stub -- they
++		# have no legitimate external caller, so hide every archive's
++		# non-essential exports from the dynamic table at link time.
++		linkflags += ['-Wl,--exclude-libs=ALL']
++		# --exclude-libs doesn't catch compiler-generated TLS-init wrapper
++		# symbols (_ZTH*) Mesa emits; hide those explicitly too (see
++		# scripts/ps5-hide-internal-symbols.map for why).
++		map_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'ps5-hide-internal-symbols.map')
++		linkflags += ['-Wl,--version-script=' + map_path]
++		# That symbol turns out to be an UNDEFINED weak reference (nm -D
++		# shows lowercase 'w'), not merely leaked-but-defined -- Mesa/
++		# libglapi's TLS model leaves it unresolved on this target, and the
++		# PS5 packaging tool treats every dynsym entry (even weak,
++		# never-called-when-unresolved ones) as a hard "must be provided by
++		# some stub" requirement. Force it to resolve to NULL at link time;
++		# weak-undefined is safe to bind to 0 by definition.
++		linkflags += ['-Wl,--defsym=_ZTH23_mesa_glapi_tls_Context=0']
+ 		return linkflags
+ 
+ 	def ldflags(self):
+ 		ldflags = []
+ 		return ldflags
+ 
++class PSP:
++	ctx               = None # waf context
++	sdk_home          = None
++	psptoolchain_path = None
++	pspsdk_path       = None
++	binutils_path     = None
++	build_prx         = None
++	fw_version        = None
++	render_type       = None
++
++	def __init__(self, ctx, moduletype, fwversion, rendertype):
++		self.ctx = ctx
++		self.build_prx = True if moduletype == 'prx' else False
++		self.fw_version = fwversion
++		self.render_type = rendertype
++
++		for i in PSP_SDK_ENVVARS:
++			self.sdk_home = os.getenv(i)
++			if self.sdk_home != None:
++				break
++		else:
++			ctx.fatal('Set %s environment variable pointing to the root of PSP SDK!' %
++				' or '.join(PSP_SDK_ENVVARS))
++
++		self.psptoolchain_path = os.path.join(self.sdk_home, 'psp')
++		self.pspsdk_path = os.path.join(self.psptoolchain_path, 'sdk')
++		self.binutils_path  = os.path.join(self.sdk_home, 'bin')
++
++	def cflags(self, cxx = False):
++		cflags = []
++		cflags += ['-I%s' % (os.path.join(self.pspsdk_path, 'include'))]
++		cflags += ['-I.']
++		cflags += ['-DNDEBUG', '-D_PSP_FW_VERSION=%s' % self.fw_version, '-G0']
++		return cflags
++
++	# they go before object list
++	def linkflags(self):
++		linkflags = []
++		return linkflags
++
++	def ldflags(self):
++		ldflags = []
++		if self.build_prx:
++			ldflags += ['-specs=%s' % os.path.join(self.pspsdk_path, 'lib/prxspecs')]
++			ldflags += ['-Wl,-q,-T%s' % os.path.join(self.pspsdk_path, 'lib/linkfile.prx')]
++		ldflags += ['-L%s' % os.path.join(self.pspsdk_path, 'lib')]
++		ldflags += ['-L.']
++		return ldflags
++
++	def stdlibs(self):
++		stdlibs = []
++		stdlibs += ['-lpspdisplay', '-lpspgum_vfpu', '-lpspgu','-lpspge', '-lpspvfpu']
++		stdlibs += ['-lpspaudio', '-lpspdmac']
++		stdlibs += ['-lstdc++', '-lc', '-lm']
++		stdlibs += ['-lpspctrl', '-lpspdebug', '-lpsppower', '-lpsputility',  '-lpspsdk', '-lpsprtc']
++		stdlibs += ['-lpspuser', '-lpspkernel']
++		return stdlibs
++
+ def options(opt):
+ 	xc = opt.add_option_group('Cross compile options')
+ 	xc.add_option('--android', action='store', dest='ANDROID_OPTS', default=None,
+@@ -537,10 +725,18 @@ def options(opt):
+ 		help='enable building for Nintendo Switch [default: %(default)s]')
+ 	xc.add_option('--psvita', action='store_true', dest='PSVITA', default = False,
+ 		help='enable building for PlayStation Vita [default: %(default)s]')
+-	xc.add_option('--sailfish', action='store', dest='SAILFISH', default = None,
+-		help='enable building for Sailfish/Aurora')
++	xc.add_option('--ps5', action='store_true', dest='PS5', default = False,
++		help='enable building for PlayStation 5 homebrew (requires PS5_PAYLOAD_SDK, PS5_OPENGL_SDK) [default: %(default)s]')
++	xc.add_option('--sailfish', action='store_true', dest='SAILFISH', default = False,
++		help='enable building for Sailfish')
+ 	xc.add_option('--emscripten', action='store_true', dest='EMSCRIPTEN', default = None,
+ 		help='enable building for Emscripten')
++	xc.add_option('--psp', action='store', dest='PSP_OPTS', default=None,
++		help='enable building for PlayStation Portable, format: --psp=<module type>,<fw version>,<render type>, example: --psp=prx,660,HW')
++	xc.add_option('--ios', action='store_true', dest='IOS', default=False, 
++		help='enable building for iOS [default: %(default)s]')
++	xc.add_option('--ios-simulator', action='store_true', dest='IOSSIM', default=False, 
++		help='enable building for iOS Simulator [default: %(default)s]')
+ 
+ def configure(conf):
+ 	if 'CROSS_COMPILE' in conf.environ:
+@@ -636,21 +832,86 @@ def configure(conf):
+ 		conf.env.LIB_M = ['m']
+ 		conf.env.VRTLD = ['vrtld']
+ 		conf.env.DEST_OS = 'psvita'
+-	elif conf.options.EMSCRIPTEN:
+-		# Emscripten compiler is just wrapper to clang
+-		# But we need to setup platform modifiers, they all are contained inside c_emscripten.py for now
+-		# In future, that could be upstreamed to waf itself and this wouldn't be needed
+-		conf.environ['CC'] = 'emcc'
+-		conf.environ['CXX'] = 'em++'
+-		conf.environ['AR'] = 'emar'
+-		conf.environ['STRIP'] = 'emstrip'
+-		conf.environ['OBJCOPY'] = 'llvm-objcopy'
+-		conf.load('c_emscripten')
++	elif conf.options.PS5:
++		conf.ps5 = ps5 = PS5(conf)
++		conf.environ['CC'] = ps5.cc()
++		conf.environ['CXX'] = ps5.cxx()
++		conf.environ['STRIP'] = ps5.strip()
++		conf.environ['AR'] = ps5.ar()
++		conf.env.PKGCONFIG = ps5.pkgconfig()
++		conf.env.CFLAGS += ps5.cflags()
++		conf.env.CXXFLAGS += ps5.cflags(True)
++		conf.env.LINKFLAGS += ps5.linkflags()
++		conf.env.LDFLAGS += ps5.ldflags()
++		conf.env.HAVE_M = True
++		conf.env.LIB_M = [] # math lives in libc.a; no separate libm to link
++		conf.env.DEST_OS = 'ps5'
++	elif conf.options.PSP_OPTS:
++		values = conf.options.PSP_OPTS.split(',')
++		if len(values) != 3:
++			conf.fatal('Invalid --psp paramater value!')
++
++		valid_module_type = ['elf', 'prx']
++		valid_render_type = ['SW', 'HW', 'ALL']
++
++		if values[0] not in valid_module_type:
++			conf.fatal('Unknown module type: %s. Supported: %r' % (values[0], ', '.join(valid_module_type)))
++		if values[2] not in valid_render_type:
++			conf.fatal('Unknown render type: %s. Supported: %r' % (values[2], ', '.join(valid_render_type)))
++
++		conf.psp = psp = PSP(conf, values[0], values[1], values[2])
++		conf.environ['CC'] = os.path.join(psp.binutils_path, 'psp-gcc')
++		conf.environ['CXX'] = os.path.join(psp.binutils_path, 'psp-gcc')
++		conf.environ['AS'] = os.path.join(psp.binutils_path, 'psp-gcc')
++		conf.environ['STRIP'] = os.path.join(psp.binutils_path, 'psp-strip')
++		conf.environ['LD'] = os.path.join(psp.binutils_path, 'psp-gcc')
++		conf.environ['AR'] = os.path.join(psp.binutils_path, 'psp-ar')
++		conf.environ['RANLIB'] = os.path.join(psp.binutils_path, 'psp-ranlib')
++		conf.environ['OBJCOPY'] = os.path.join(psp.binutils_path, 'psp-objcopy')
++
++		conf.env.PRXGEN = conf.find_program('psp-prxgen', path_list = psp.binutils_path)
++		conf.env.MKSFO =  conf.find_program('mksfoex', path_list = psp.binutils_path)
++		conf.env.PACK_PBP = conf.find_program('pack-pbp', path_list = psp.binutils_path)
++		conf.env.FIXUP =  conf.find_program('psp-fixup-imports', path_list = psp.binutils_path)
++
++		conf.env.ASFLAGS += psp.cflags()
++		conf.env.CFLAGS += psp.cflags()
++		conf.env.CXXFLAGS += psp.cflags()
++		conf.env.LINKFLAGS += psp.linkflags()
++		conf.env.LDFLAGS += psp.ldflags()
++
++		conf.msg('Selected PSPSDK', '%s' % (psp.sdk_home))
++		# no need to print C/C++ compiler, as it would be printed by compiler_c/cxx
++		conf.msg('... C/C++ flags', ' '.join(psp.cflags()).replace(psp.sdk_home, '$PSPSDK'))
++		conf.msg('... link flags', ' '.join(psp.linkflags()).replace(psp.sdk_home, '$PSPSDK'))
++		conf.msg('... ld flags', ' '.join(psp.ldflags()).replace(psp.sdk_home, '$PSPSDK'))
++		conf.msg('Bulid prx', '%s' % (psp.build_prx))
++
++		if conf.options.PROFILING:
++			conf.env.LDFLAGS += ['-lpspprof']
++			conf.env.CFLAGS += ['-pg']
++			conf.env.CXXFLAGS += ['-pg']
++		conf.env.LDFLAGS += psp.stdlibs()
++
++		conf.env.PSP_RENDER_TYPE = psp.render_type
++		conf.env.PSP_BUILD_PRX = psp.build_prx
++	elif conf.options.IOS or conf.options.IOSSIM:
++		issim = True if conf.options.IOSSIM else False
++
++		conf.ios = ios = iOS(conf, issim)
++
++		conf.environ['CC'] = ios.cc()
++		conf.environ['CXX'] = ios.cxx()
++		
++		conf.env.CFLAGS += ios.cflags()
++		conf.env.CXXFLAGS += ios.cflags()
++		conf.env.LINKFLAGS += ios.linkflags()
++		conf.env.IOS = 1
+ 
+ 	conf.env.MAGX = conf.options.MAGX
+ 	conf.env.MSVC_WINE = conf.options.MSVC_WINE
+ 	conf.env.SAILFISH = conf.options.SAILFISH
+-	MACRO_TO_DESTOS = OrderedDict({ '__ANDROID__' : 'android', '__SWITCH__' : 'nswitch', '__vita__' : 'psvita', '__wasi__': 'wasi', '__EMSCRIPTEN__' : 'emscripten' })
++	MACRO_TO_DESTOS = OrderedDict({ '__ANDROID__' : 'android', '__SWITCH__' : 'nswitch', '__vita__' : 'psvita', '__wasi__': 'wasi', '__EMSCRIPTEN__' : 'emscripten', '__psp__': 'psp' })
+ 	for k in c_config.MACRO_TO_DESTOS:
+ 		MACRO_TO_DESTOS[k] = c_config.MACRO_TO_DESTOS[k] # ordering is important
+ 	c_config.MACRO_TO_DESTOS  = MACRO_TO_DESTOS
+diff --git a/wscript b/wscript
+index 79d2776..11e16ad 100644
+--- a/wscript
++++ b/wscript
+@@ -78,6 +78,13 @@ def configure(conf):
+ 	# Load compilers early
+ 	conf.load('xcompile compiler_c compiler_cxx')
+ 
++	# WORKAROUND: prospero-clang (PS5 toolchain) defines __FreeBSD__ since
++	# the PS5 kernel is FreeBSD-derived; waf's get_cc_version() probes the
++	# compiler's predefined macros and unconditionally overwrites DEST_OS,
++	# clobbering the 'ps5' set in xcompile.py's PS5 branch with 'freebsd'.
++	if conf.options.PS5:
++		conf.env.DEST_OS = 'ps5'
++
+ 	# Disable compiler-backed dependency calculation with caching
+ 	# bug: https://gitlab.com/ita1024/waf/-/issues/2478
+ 	if not conf.options.WAFCACHE:
+@@ -229,6 +236,10 @@ def configure(conf):
+ 		else:
+ 			for i in a:
+ 				conf.check_cc(lib = i)
++	elif conf.env.DEST_OS == 'ps5':
++		# math functions live inside libc.a on this target, there is no
++		# separate libm to link against (same as xash3d-fwgs's PS5 port).
++		pass
+ 	else:
+ 		conf.check_cc(lib='m')
+ 

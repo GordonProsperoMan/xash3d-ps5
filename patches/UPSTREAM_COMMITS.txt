@@ -1,0 +1,6 @@
+xash3d-fwgs 1414fc281b6dc986378ea7ae35086c62d782a865
+mainui_cpp 64b3ed54caf08e23a8aaeefe1aa1275eb24df281
+hlsdk-portable 6c168fc79d95c8ffb934fa37aaafbbd424e03c1a
+ps5-opengl dce74910af7f4274c48d05e0ae001b3038462588 https://github.com/blackbearreloaded/ps5-opengl.git
+ps5-native-app-boilerplate 4f531c4b517f80bcb6b1267135848168d2250047 https://github.com/blackbearreloaded/ps5-native-app-boilerplate.git
+ps5-sdl 8c56053f13ca13a0c050de613706ff69eb615836 https://github.com/ps5-payload-dev/SDL.git

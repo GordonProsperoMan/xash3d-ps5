@@ -1,0 +1,257 @@
+diff --git a/BaseMenu.h b/BaseMenu.h
+index 4d663ef..63fab94 100755
+--- a/BaseMenu.h
++++ b/BaseMenu.h
+@@ -273,6 +273,7 @@ void UI_LoadGame_Menu( void );
+ void UI_SaveGame_Menu( void );
+ void UI_SaveLoad_Menu( void );
+ void UI_MultiPlayer_Menu( void );
++void UI_Debug_Menu( void ); // XashPS5 debug menu
+ void UI_Options_Menu( void );
+ void UI_InternetGames_Menu( void );
+ void UI_LanGame_Menu( void );
+diff --git a/exports.txt b/exports.txt
+index 50217f6..f3dafcb 100644
+--- a/exports.txt
++++ b/exports.txt
+@@ -1,2 +1,3 @@
+ GetMenuAPI
+ GetExtAPI
++AddTouchButtonToList
+diff --git a/menus/Debug.cpp b/menus/Debug.cpp
+new file mode 100644
+index 0000000..12bac0f
+--- /dev/null
++++ b/menus/Debug.cpp
+@@ -0,0 +1,189 @@
++/*
++Debug.cpp - XashPS5 debug menu: map loader + cheats
++Copyright (C) 2026 XashPS5 port
++
++This program is free software: you can redistribute it and/or modify
++it under the terms of the GNU General Public License as published by
++the Free Software Foundation, either version 3 of the License, or
++(at your option) any later version.
++
++Console-free access (gamepad only) to:
++  - every map found in maps/*.bsp, loaded in single player with cheats on
++  - god mode / noclip / notarget toggles
++  - "all weapons" (impulse 101) and full health/armor
++*/
++
++#include "Framework.h"
++#include "PicButton.h"
++#include "Table.h"
++#include "YesNoMessageBox.h"
++#include "keydefs.h"
++
++#define ART_BANNER "gfx/shell/head_custom"
++// no artwork for these buttons: the PicButton falls back to drawing its text
++#define BTN_TEXT   "gfx/shell/btn_ps5debug"
++
++struct debug_map_t
++{
++	char name[64];
++};
++
++class CMenuDebug;
++
++class CMenuDebugMapModel : public CMenuBaseModel, public CUtlVector<debug_map_t>
++{
++public:
++	void Update() override;
++	int GetColumns() const override { return 1; }
++	int GetRows() const override { return Count(); }
++	const char *GetCellText( int line, int column ) override
++	{
++		return Element( line ).name;
++	}
++	void OnActivateEntry( int line ) override;
++};
++
++class CMenuDebug : public CMenuFramework
++{
++public:
++	CMenuDebug() : CMenuFramework( "CMenuDebug" ) { }
++
++	void Show() override
++	{
++		mapsModel.Update();
++		CMenuFramework::Show();
++	}
++
++	static void LoadMap( const char *map );
++	static void Cheat( const char *cmd );
++
++	CMenuTable         mapsList;
++	CMenuDebugMapModel mapsModel;
++	CMenuYesNoMessageBox msgBox;
++
++private:
++	void _Init() override;
++	void _VidInit() override;
++};
++
++static CMenuDebug *g_pDebugMenu;
++
++static int DebugMapCompare( const debug_map_t *a, const debug_map_t *b )
++{
++	return stricmp( a->name, b->name );
++}
++
++void CMenuDebugMapModel::Update( void )
++{
++	int numFiles = 0;
++	char **files;
++
++	RemoveAll();
++
++	files = EngFuncs::GetFilesList( "maps/*.bsp", &numFiles, false );
++	for( int i = 0; files && i < numFiles; i++ )
++	{
++		debug_map_t m;
++		const char *base = strrchr( files[i], '/' );
++		base = base ? base + 1 : files[i];
++
++		Q_strncpy( m.name, base, sizeof( m.name ));
++		char *ext = strrchr( m.name, '.' );
++		if( ext ) *ext = 0;
++
++		AddToTail( m );
++	}
++
++	CUtlVector<debug_map_t>::Sort( DebugMapCompare );
++}
++
++void CMenuDebugMapModel::OnActivateEntry( int line )
++{
++	if( IsValidIndex( line ))
++		CMenuDebug::LoadMap( Element( line ).name );
++}
++
++void CMenuDebug::LoadMap( const char *map )
++{
++	char cmd[256], esc[128];
++
++	if( !map || !map[0] || !EngFuncs::IsMapValid( map ))
++	{
++		UI_ShowMessageBox( L( "This map can't be loaded." ));
++		return;
++	}
++
++	if( EngFuncs::GetCvarFloat( "host_serverstate" ))
++		EngFuncs::HostEndGame( "loading debug map" );
++
++	EngFuncs::PlayBackgroundTrack( NULL, NULL );
++
++	Com_EscapeCommand( esc, map, sizeof( esc ));
++	// single player, cheats enabled so god/noclip/impulse 101 work
++	snprintf( cmd, sizeof( cmd ),
++		"disconnect;deathmatch 0;coop 0;maxplayers 1;sv_cheats 1;wait;wait;map %s\n", esc );
++	EngFuncs::ClientCmd( false, cmd );
++}
++
++void CMenuDebug::Cheat( const char *cmd )
++{
++	char buf[256];
++
++	if( !CL_IsActive( ))
++	{
++		UI_ShowMessageBox( L( "Start or load a game first." ));
++		return;
++	}
++
++	// sv_cheats is unlocked for local games by the engine (SV_SpawnServer)
++	snprintf( buf, sizeof( buf ), "sv_cheats 1;%s\n", cmd );
++	EngFuncs::ClientCmd( false, buf );
++	UI_CloseMenu(); // back to the game so the effect is visible right away
++}
++
++void CMenuDebug::_Init( void )
++{
++	g_pDebugMenu = this;
++
++	banner.SetPicture( ART_BANNER );
++	AddItem( banner );
++
++	AddButton( L( "Load map" ), L( "Load the map selected in the list (Cross on the list also loads it)" ), BTN_TEXT,
++		(VoidCallback)[]( void ) {
++			int i = g_pDebugMenu->mapsList.GetCurrentIndex();
++			if( g_pDebugMenu->mapsModel.IsValidIndex( i ))
++				CMenuDebug::LoadMap( g_pDebugMenu->mapsModel[i].name );
++		}, QMF_NOTIFY );
++
++	AddButton( L( "God mode" ), L( "Toggle invincibility (god)" ), BTN_TEXT,
++		(VoidCallback)[]( void ) { CMenuDebug::Cheat( "god" ); }, QMF_NOTIFY );
++
++	AddButton( L( "All weapons" ), L( "Give the HEV suit, every weapon and ammo (impulse 101)" ), BTN_TEXT,
++		(VoidCallback)[]( void ) { CMenuDebug::Cheat( "impulse 101" ); }, QMF_NOTIFY );
++
++	AddButton( L( "Full health" ), L( "Restore health and armor" ), BTN_TEXT,
++		(VoidCallback)[]( void ) { CMenuDebug::Cheat( "give item_healthkit;give item_healthkit;give item_battery;give item_battery;give item_battery" ); }, QMF_NOTIFY );
++
++	AddButton( L( "Noclip" ), L( "Toggle flying through walls" ), BTN_TEXT,
++		(VoidCallback)[]( void ) { CMenuDebug::Cheat( "noclip" ); }, QMF_NOTIFY );
++
++	AddButton( L( "Notarget" ), L( "Toggle: monsters ignore you" ), BTN_TEXT,
++		(VoidCallback)[]( void ) { CMenuDebug::Cheat( "notarget" ); }, QMF_NOTIFY );
++
++	AddButton( L( "Test vibration" ), L( "Rumble the controller for one second" ), BTN_TEXT,
++		(VoidCallback)[]( void ) { EngFuncs::ClientCmd( false, "vibrate 1000\n" ); }, QMF_NOTIFY );
++
++	AddButton( L( "Done" ), L( "Go back to the Main menu" ), PC_DONE, VoidCb( &CMenuDebug::Hide ), QMF_NOTIFY );
++
++	mapsList.SetCharSize( QM_SMALLFONT );
++	mapsList.SetupColumn( 0, L( "GameUI_Map" ), 1.0f );
++	mapsList.SetModel( &mapsModel );
++	AddItem( mapsList );
++}
++
++void CMenuDebug::_VidInit( void )
++{
++	mapsList.SetRect( 420, 230, -20, 465 );
++}
++
++ADD_MENU( menu_ps5debug, CMenuDebug, UI_Debug_Menu );
+diff --git a/menus/Main.cpp b/menus/Main.cpp
+index 4d1a382..0c20760 100644
+--- a/menus/Main.cpp
++++ b/menus/Main.cpp
+@@ -73,6 +73,7 @@ private:
+ 	CMenuPicButton	customGame;
+ 	CMenuPicButton	previews;
+ 	CMenuPicButton	quit;
++	CMenuPicButton	debugMenu; // XashPS5
+ 
+ 	// buttons on top right. Maybe should be drawn if fullscreen == 1?
+ 	CMenuBitmap	minimizeBtn;
+@@ -228,6 +229,11 @@ void CMenuMain::_Init( void )
+ 	previews.iFlags |= QMF_NOTIFY;
+ 	SET_EVENT( previews.onReleased, EngFuncs::ShellExecute( MenuStrings[ IDS_MEDIA_PREVIEWURL ], NULL, false ) );
+ 
++	debugMenu.SetNameAndStatus( L( "Debug" ), L( "Load any map, god mode, all weapons" ) );
++	debugMenu.SetPicture( "gfx/shell/btn_ps5debug" ); // no art: drawn as text
++	debugMenu.iFlags |= QMF_NOTIFY;
++	debugMenu.onReleased = UI_Debug_Menu;
++
+ 	quit.SetNameAndStatus( L( "GameUI_GameMenu_Quit" ), L( "GameUI_QuitConfirmationText" ) );
+ 	quit.SetPicture( PC_QUIT );
+ 	quit.iFlags |= QMF_NOTIFY;
+@@ -298,6 +304,7 @@ void CMenuMain::_Init( void )
+ 		AddItem( customGame );
+ 
+ 	AddItem( previews );
++	AddItem( debugMenu );
+ 	AddItem( quit );
+ 	AddItem( minimizeBtn );
+ 	AddItem( quitButton );
+@@ -366,6 +373,9 @@ void CMenuMain::VidInit( bool connected )
+ 		}
+ 	}
+ 
++	debugMenu.SetCoord( hoffset, yoffset );
++	yoffset -= ygap;
++
+ 	console.SetCoord( hoffset, yoffset );
+ 	yoffset -= ygap;
+ 

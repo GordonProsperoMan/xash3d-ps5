@@ -1,0 +1,2317 @@
+diff --git a/common/backends.h b/common/backends.h
+index e0cc14b..3241bb3 100644
+--- a/common/backends.h
++++ b/common/backends.h
+@@ -27,6 +27,7 @@ GNU General Public License for more details.
+ #define SOUND_SDL      1
+ #define SOUND_PSP      2
+ #define SOUND_ALSA     3
++#define SOUND_PS5      4
+ 
+ // input (XASH_INPUT)
+ #define INPUT_NULL    0
+diff --git a/common/defaults.h b/common/defaults.h
+index 7cd9c1f..daa108e 100644
+--- a/common/defaults.h
++++ b/common/defaults.h
+@@ -33,7 +33,11 @@ SETUP BACKENDS DEFINITIONS
+ 	#if XASH_SDL // we are building with SDL
+ 		#define XASH_VIDEO     VIDEO_SDL
+ 		#define XASH_INPUT     INPUT_SDL
+-		#define XASH_SOUND     SOUND_SDL
++		#if XASH_PS5 // ps5-opengl's SDL2 has no audio: native sceAudioOut backend
++			#define XASH_SOUND     SOUND_PS5
++		#else
++			#define XASH_SOUND     SOUND_SDL
++		#endif
+ 	#elif XASH_LINUX // we are building for Linux without SDL, only framebuffer is supported for now
+ 		#define XASH_VIDEO     VIDEO_FBDEV
+ 		#define XASH_INPUT     INPUT_EVDEV
+diff --git a/engine/common/filesystem_engine.c b/engine/common/filesystem_engine.c
+index 9ed62eb..da2a925 100644
+--- a/engine/common/filesystem_engine.c
++++ b/engine/common/filesystem_engine.c
+@@ -279,6 +279,16 @@ static qboolean FS_DetermineRootDirectory( char *out, size_t size )
+ 		return true;
+ 	Sys_Error( "couldn't find %s data directory", XASH_ENGINE_NAME );
+ 	return false;
++#elif XASH_PS5
++	// SDL_GetBasePath() on this target's "G19" driver resolves argv[0]'s
++	// directory via POSIX conventions that don't apply to a PS5 native
++	// folder app (there is no real argv[0] path on the console's own
++	// filesystem) -- use the fixed /app0 read-only package mount instead,
++	// same pattern as PSVita/NSwitch bypassing the generic SDL2 path.
++	if( PS5_GetBasePath( out, size ))
++		return true;
++	Sys_Error( "couldn't find %s data directory", XASH_ENGINE_NAME );
++	return false;
+ #elif ( XASH_SDL >= 2 ) && !XASH_NSWITCH // GetBasePath not impl'd in switch-sdl2
+ 	// SDL2 hands the base path over to us, SDL3 keeps ownership and frees it on quit
+ 	qboolean owned = XASH_SDL == 2;
+@@ -339,6 +349,10 @@ static qboolean FS_DetermineReadOnlyRootDirectory( char *out, size_t size )
+ #if XASH_IOS
+ 	Q_strncpy( out, IOS_GetExecDir(), size );
+ 	return true;
++#elif XASH_PS5
++	// game data ships read-only inside the package mount
++	Q_strncpy( out, "/app0", size );
++	return true;
+ #endif
+ 
+ 	return false;
+diff --git a/engine/common/host.c b/engine/common/host.c
+index f726046..c07732e 100644
+--- a/engine/common/host.c
++++ b/engine/common/host.c
+@@ -654,6 +654,16 @@ static qboolean Host_FilterTime( double time )
+ Host_Frame
+ =================
+ */
++#if XASH_PS5
++double ps5_prof_in, ps5_prof_sv, ps5_prof_cl, ps5_prof_swap;
++static double ps5_prof_counters[8];
++__attribute__((visibility("default"))) double *PS5Prof_Counters( void ) { return ps5_prof_counters; }
++#define ps5_shim_flush_time  ps5_prof_counters[0]
++#define ps5_shim_flush_count ps5_prof_counters[1]
++#define ps5_shim_flush_verts ps5_prof_counters[2]
++#define ps5_shim_array_time  ps5_prof_counters[3]
++#define ps5_shim_array_count ps5_prof_counters[4]
++#endif
+ void Host_Frame( double time )
+ {
+ 	// decide the simulation time
+@@ -665,16 +675,60 @@ void Host_Frame( double time )
+ 	if( host.framecount == 0 )
+ 		Con_DPrintf( "Time to first frame: %.3f seconds\n", t1 - host.starttime );
+ 
++#if XASH_PS5
++	double pt0 = Platform_DoubleTime();
++	Host_InputFrame ();  // input frame
++	Host_ClientBegin (); // begin client
++	Host_GetCommands (); // dedicated in
++	double pt1 = Platform_DoubleTime();
++	Host_ServerFrame (); // server frame
++	double pt2 = Platform_DoubleTime();
++	Host_ClientFrame (); // client frame
++	double pt3 = Platform_DoubleTime();
++	extern double ps5_prof_in, ps5_prof_sv, ps5_prof_cl;
++	ps5_prof_in += pt1 - pt0; ps5_prof_sv += pt2 - pt1; ps5_prof_cl += pt3 - pt2;
++#else
+ 	Host_InputFrame ();  // input frame
+ 	Host_ClientBegin (); // begin client
+ 	Host_GetCommands (); // dedicated in
+ 	Host_ServerFrame (); // server frame
+ 	Host_ClientFrame (); // client frame
++#endif
+ 	HTTP_Run();			 // both server and client
+ 	XRcon_Frame();
+ 
+ 	host.framecount++;
+ 	host.pureframetime = Platform_DoubleTime() - t1;
++
++#if XASH_PS5
++	{
++		// PS5 perf probe: every 5 s, print real FPS and average CPU time per frame
++		static double window_start;
++		static double pure_sum;
++		static int frames;
++		double now = Platform_DoubleTime();
++
++		if( window_start <= 0.0 )
++			window_start = now;
++		frames++;
++		pure_sum += host.pureframetime;
++		if( now - window_start >= 5.0 )
++		{
++			extern double ps5_prof_swap;
++			Con_Printf( "PS5PERF arrays=%d array_ms=%.2f\n", (int)( ps5_shim_array_count / frames ), 1000.0 * ps5_shim_array_time / frames );
++			ps5_shim_array_time = 0.0; ps5_shim_array_count = 0;
++			Con_Printf( "PS5PERF fps=%.1f cpu_ms=%.2f in=%.2f sv=%.2f cl=%.2f swap=%.2f draws=%d verts=%d draw_ms=%.2f state=%d\n", frames / ( now - window_start ),
++				1000.0 * pure_sum / frames, 1000.0 * ps5_prof_in / frames, 1000.0 * ps5_prof_sv / frames,
++				1000.0 * ps5_prof_cl / frames, 1000.0 * ps5_prof_swap / frames,
++				(int)( ps5_shim_flush_count / frames ), (int)( ps5_shim_flush_verts / frames ), 1000.0 * ps5_shim_flush_time / frames, cls.state );
++			ps5_shim_flush_time = 0.0; ps5_shim_flush_count = ps5_shim_flush_verts = 0;
++			ps5_prof_in = ps5_prof_sv = ps5_prof_cl = ps5_prof_swap = 0.0;
++			window_start = now;
++			pure_sum = 0.0;
++			frames = 0;
++		}
++	}
++#endif
+ }
+ 
+ /*
+diff --git a/engine/common/launcher.c b/engine/common/launcher.c
+index 70adc33..e566b37 100644
+--- a/engine/common/launcher.c
++++ b/engine/common/launcher.c
+@@ -15,6 +15,8 @@ GNU General Public License for more details.
+ 
+ #if XASH_ENABLE_MAIN
+ #include "build.h"
++#include <stdio.h>
++#include <string.h>
+ #include "common.h"
+ 
+ #if XASH_SDLMAIN
+@@ -41,6 +43,50 @@ int main( int argc, char **argv )
+ #elif XASH_IOS
+ 	IOS_LaunchDialog();
+ 	szArgc = IOS_GetArgs( &szArgv );
++#elif XASH_PS5
++	// ps5-opengl's SDL2 "G19" video driver hard-rejects any GL context
++	// that isn't exactly 3.3 Core with default flags (see
++	// integration/SDL2/SDL_ps5g19.c create_context(): "G19 SDL requires
++	// one unshared OpenGL 3.3 Core context with default flags" -- any
++	// other request returns NULL from SDL_GL_CreateContext, which the
++	// ref_gl backend doesn't recover from, crashing before the first
++	// frame). ref/gl only requests that exact profile when launched with
++	// -glcore; a native PS5 title has no command line to pass that flag
++	// on, so force it here, the same way PSVita forces its own required
++	// flags above.
++	{
++		static char *ps5_argv[64];
++		// -dev 2 / -console: debug builds mirror the whole console to klogsrv
++		// -gl2shim: Core profile has no fixed-function GL; ref_gl's shim emulates it
++		static const char *forced_args[] = { "-glcore", "-gl2shim", "-dev", "2", "-console" };
++		int i, j;
++
++		for( i = 0; i < argc && i < 58; i++ )
++			ps5_argv[i] = argv[i];
++		for( j = 0; j < (int)( sizeof( forced_args ) / sizeof( forced_args[0] )); j++ )
++			ps5_argv[i++] = (char *)forced_args[j];
++
++		// Extra args from a writable file (no command line on PS5): lets us try
++		// engine/renderer switches over FTP without rebuilding the eboot.
++		{
++			static char extra[1024];
++			FILE *fp = fopen( "/download0/xash_args.txt", "r" );
++			if( !fp )
++				fp = fopen( "/app0/xash_args.txt", "r" );
++			if( fp )
++			{
++				size_t n = fread( extra, 1, sizeof( extra ) - 1, fp );
++				char *tok;
++				fclose( fp );
++				extra[n] = 0;
++				for( tok = strtok( extra, " \t\r\n" ); tok && i < 62; tok = strtok( NULL, " \t\r\n" ))
++					ps5_argv[i++] = tok;
++			}
++		}
++		ps5_argv[i] = NULL;
++		szArgc = i;
++		szArgv = ps5_argv;
++	}
+ #else
+ 	szArgc = argc;
+ 	szArgv = argv;
+diff --git a/engine/common/lib_static.c b/engine/common/lib_static.c
+new file mode 100644
+index 0000000..e69de29
+diff --git a/engine/common/net_ws.c b/engine/common/net_ws.c
+index d139dff..0de463c 100644
+--- a/engine/common/net_ws.c
++++ b/engine/common/net_ws.c
+@@ -153,7 +153,7 @@ qboolean NET_IsSocketValid( int socket )
+ 
+ qboolean NET_MakeSocketNonBlocking( int socket_fd )
+ {
+-#if XASH_LINUX
++#if XASH_LINUX || XASH_PS5 // PS5 (FreeBSD): fcntl O_NONBLOCK, ioctl is not reliable for native titles
+ 	int res = fcntl( socket_fd, F_GETFL, 0 );
+ 	if( NET_IsSocketError( res ))
+ 		return false;
+@@ -1348,7 +1348,12 @@ static qboolean NET_QueuePacket( int net_socket, netsrc_t sock, netadr_t *from,
+ 		return NET_LagPacket( false, sock, from, length, data );
+ 
+ 	WSAsize_t addr_len = sizeof( addr );
++#if XASH_PS5
++	// never let the main thread block on an empty socket, even if O_NONBLOCK was refused
++	int ret = recvfrom( net_socket, buf, sizeof( buf ), MSG_DONTWAIT, (struct sockaddr *)&addr, &addr_len );
++#else
+ 	int ret = recvfrom( net_socket, buf, sizeof( buf ), 0, (struct sockaddr *)&addr, &addr_len );
++#endif
+ 
+ 	NET_SockadrToNetadr( &addr, from );
+ 
+@@ -1609,8 +1614,9 @@ static int NET_IPSocket( const char *net_iface, int port, int family )
+ 		struct timeval timeout;
+ 
+ 		Con_DPrintf( S_WARN "%s: port: %d ioctl FIONBIO: %s\n", __func__, port, NET_ErrorString( ));
+-		// try timeout instead of NBIO
+-		timeout.tv_sec = timeout.tv_usec = 0;
++		// try timeout instead of NBIO (a zero timeout means "block forever" on BSD sockets)
++		timeout.tv_sec = 0;
++		timeout.tv_usec = 1;
+ 		setsockopt( net_socket, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout));
+ 	}
+ 
+diff --git a/engine/common/sys_con.c b/engine/common/sys_con.c
+index b4e5bb2..41a1ce8 100644
+--- a/engine/common/sys_con.c
++++ b/engine/common/sys_con.c
+@@ -22,6 +22,10 @@ GNU General Public License for more details.
+ #if XASH_IRIX
+ #include <sys/time.h>
+ #endif
++#if XASH_PS5
++#include <fcntl.h>
++#include <unistd.h>
++#endif
+ #include "xash3d_mathlib.h"
+ #if XASH_WIN32
+ #include <io.h>
+@@ -277,6 +281,24 @@ static void Sys_PrintStdout( const char *logtime, size_t logtime_len, const char
+ 	fprintf( stderr, "%s %s", logtime, stripped );
+ #endif // XASH_NSWITCH && NSWITCH_DEBUG
+ 
++#if XASH_PS5
++	{
++		// Native PS5 titles have no visible stdout: mirror every console
++		// line to the kernel debug channel (relayed by etaHEN klogsrv) and
++		// to a world-readable file reachable over FTP, so startup failures
++		// that end in exit(1) are diagnosable on real hardware.
++		extern int sceKernelDebugOutText( int channel, const char *text );
++		static int ps5_log_fd = -2;
++		char line[1024];
++		Q_snprintf( line, sizeof( line ), "[XASH] %s", stripped );
++		sceKernelDebugOutText( 0, line );
++		if( ps5_log_fd == -2 )
++			ps5_log_fd = open( "/data/xash_log.txt", O_WRONLY | O_CREAT | O_TRUNC, 0666 );
++		if( ps5_log_fd >= 0 )
++			write( ps5_log_fd, stripped, Q_strlen( stripped ));
++	}
++#endif
++
+ #if XASH_PSVITA
+ 	// spew to stderr only in developer mode
+ 	if( host_developer.value )
+diff --git a/engine/platform/platform.h b/engine/platform/platform.h
+index 4a3afa4..34f8c16 100644
+--- a/engine/platform/platform.h
++++ b/engine/platform/platform.h
+@@ -130,6 +130,14 @@ int PSVita_GetArgv( int in_argc, char **in_argv, char ***out_argv );
+ void PSVita_InputUpdate( void );
+ #endif
+ 
++#if XASH_PS5
++// PS5 homebrew backend (ps5-payload-sdk + ps5-opengl/SDL2 "G19" bridge).
++// Native folder-app entrypoint; no WebKit payload loader involved at runtime.
++void PS5_Init( void );
++void PS5_Shutdown( void );
++qboolean PS5_GetBasePath( char *buf, const size_t buflen );
++#endif
++
+ #if XASH_DOS
+ void DOS_Init( void );
+ void DOS_Shutdown( void );
+@@ -313,6 +321,9 @@ static inline void Platform_MouseMove( float *x, float *y )
+ // might keep it visible when it shows the on-screen keyboard over the game
+ #if XASH_SDL >= 2 || XASH_PSVITA || XASH_DOS || XASH_USE_EVDEV
+ void Platform_EnableTextInput( qboolean enable, int x, int y, int w, int h );
++#if XASH_PS5
++void PS5_InputUpdate( void );
++#endif
+ #else
+ static inline void Platform_EnableTextInput( qboolean enable, int x, int y, int w, int h ) { }
+ #endif
+diff --git a/engine/platform/posix/crash_posix.c b/engine/platform/posix/crash_posix.c
+index 35556a7..9aa0136 100644
+--- a/engine/platform/posix/crash_posix.c
++++ b/engine/platform/posix/crash_posix.c
+@@ -17,6 +17,7 @@ GNU General Public License for more details.
+ 
+ #if XASH_FREEBSD || XASH_NETBSD || XASH_OPENBSD || XASH_ANDROID || XASH_LINUX || XASH_APPLE
+ #include <signal.h>
++#include <ucontext.h>
+ #include <sys/mman.h>
+ #if XASH_ANDROID
+ #include <sys/stat.h>
+@@ -49,6 +50,36 @@ static void Sys_Crash( int signal, siginfo_t *si, void *context )
+ #endif
+ 
+ 	ssize_t unused = write( STDERR_FILENO, crash_message, len );
++#if XASH_PS5
++	{
++		// stderr goes nowhere on a native title: mirror to klogsrv with the
++		// faulting RIP and a frame-pointer walk so addr2line can resolve it.
++		extern int sceKernelDebugOutText( int channel, const char *text );
++		extern char __executable_start[] __attribute__((weak));
++		ucontext_t *uc = (ucontext_t *)context;
++		char line[256];
++		uintptr_t rip = (uintptr_t)uc->uc_mcontext.mc_rip;
++		uintptr_t rbp = (uintptr_t)uc->uc_mcontext.mc_rbp;
++		uintptr_t base = (uintptr_t)__executable_start;
++		sceKernelDebugOutText( 0, "[XASH] CRASH " );
++		sceKernelDebugOutText( 0, crash_message );
++		Q_snprintf( line, sizeof( line ), "[XASH] CRASH rip=%p (off 0x%lx) rsp=%p rbp=%p base=%p\n",
++			(void *)rip, (unsigned long)( rip - base ), (void *)uc->uc_mcontext.mc_rsp, (void *)rbp, (void *)base );
++		sceKernelDebugOutText( 0, line );
++		// only walk frames that sit inside the faulting thread's stack
++		uintptr_t rsp = (uintptr_t)uc->uc_mcontext.mc_rsp;
++		for( int i = 0; i < 24 && rbp && !( rbp & 7 ) && rbp >= rsp && rbp - rsp < ( 8u << 20 ); i++ )
++		{
++			uintptr_t ret = ((uintptr_t *)rbp)[1];
++			uintptr_t next = ((uintptr_t *)rbp)[0];
++			Q_snprintf( line, sizeof( line ), "[XASH] CRASH #%d %p (off 0x%lx)\n", i, (void *)ret, (unsigned long)( ret - base ));
++			sceKernelDebugOutText( 0, line );
++			if( next <= rbp )
++				break;
++			rbp = next;
++		}
++	}
++#endif
+ 
+ #if XASH_ANDROID
+ 	__android_log_write( ANDROID_LOG_FATAL, "Xash", crash_message );
+diff --git a/engine/platform/ps5/app_heap.c b/engine/platform/ps5/app_heap.c
+new file mode 100644
+index 0000000..68e51d1
+--- /dev/null
++++ b/engine/platform/ps5/app_heap.c
+@@ -0,0 +1,273 @@
++// PS5 OpenGL - OpenGL implementation for PlayStation 5.
++// Copyright (C) 2026 BlackBearReloaded
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++/* Shared native-app allocator integration, originally used by the CTS runner. */
++#include <errno.h>
++#include <stdatomic.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/mman.h>
++
++void *__real_malloc(size_t size);
++void *__real_calloc(size_t count, size_t size);
++void *__real_realloc(void *address, size_t size);
++void __real_free(void *address);
++int __real_posix_memalign(void **address, size_t alignment, size_t size);
++size_t __real_malloc_usable_size(const void *address);
++
++void *sceLibcMspaceCreate(const char *name, void *base, size_t size,
++                          unsigned flags);
++void *sceLibcMspaceMalloc(void *mspace, size_t size);
++void *sceLibcMspaceCalloc(void *mspace, size_t count, size_t size);
++void *sceLibcMspaceRealloc(void *mspace, void *address, size_t size);
++void sceLibcMspaceFree(void *mspace, void *address);
++int sceLibcMspacePosixMemalign(void *mspace, void **address, size_t alignment,
++                              size_t size);
++size_t sceLibcMspaceMallocUsableSize(const void *address);
++int64_t sceKernelGetDirectMemorySize(void);
++int32_t sceKernelAllocateDirectMemory(int64_t search_start, int64_t search_end,
++                                     size_t length, size_t alignment,
++                                     int memory_type, int64_t *physical_start);
++int32_t sceKernelMapDirectMemory(void **address, size_t length, int protection,
++                                int flags, int64_t physical_start, size_t alignment);
++
++/* ponytail: 128 MiB process-lifetime heap by default; revisit the budget only
++ * for measured application needs. Do not unmap underneath late C++ destructors.
++ * A title may define ps5_opengl_heap_size to reserve more (the CTS runner keeps
++ * every test case object alive); smaller sizes are tried if mapping fails. */
++__attribute__((weak)) const size_t ps5_opengl_heap_size = 128u * 1024u * 1024u;
++/* A title may define ps5_opengl_heap_zero_fill as 1: malloc, posix_memalign and
++ * the growth of realloc then return zero-filled memory, so code that reads heap
++ * memory it never wrote behaves the same on every run. */
++__attribute__((weak)) const int ps5_opengl_heap_zero_fill = 0;
++static size_t ps5_heap_size;
++#define PS5_OPENGL_HEAP_SIZE ps5_heap_size
++
++static atomic_int ps5_heap_state;
++static void *ps5_heap_base;
++static void *ps5_heap_mspace;
++/* Owned-heap usable bytes only: not GPU mappings, foreign heaps or process RSS.
++ * Relaxed snapshots are observations, not an allocator synchronization fence. */
++static atomic_size_t ps5_heap_live_bytes, ps5_heap_peak_bytes, ps5_heap_blocks;
++static atomic_size_t ps5_heap_failures, ps5_heap_ambiguous_zero_reallocs;
++
++static void ps5_heap_resize_stats(size_t before, size_t after) {
++  size_t live = after >= before
++      ? atomic_fetch_add_explicit(&ps5_heap_live_bytes, after - before,
++                                  memory_order_relaxed) + after - before
++      : atomic_fetch_sub_explicit(&ps5_heap_live_bytes, before - after,
++                                  memory_order_relaxed) - (before - after);
++  size_t peak = atomic_load_explicit(&ps5_heap_peak_bytes, memory_order_relaxed);
++  while (live > peak && !atomic_compare_exchange_weak_explicit(
++      &ps5_heap_peak_bytes, &peak, live, memory_order_relaxed, memory_order_relaxed)) {}
++}
++
++/* Weak: host builds of this file have no libkernel. */
++int sceKernelDebugOutText(int channel, const char *text) __attribute__((weak));
++void __wrap_free(void *address);
++
++static void *ps5_heap_record_allocation(void *address, size_t size) {
++  const int nonzero = size != 0;
++  if (address) {
++    ps5_heap_resize_stats(0, sceLibcMspaceMallocUsableSize(address));
++    atomic_fetch_add_explicit(&ps5_heap_blocks, 1, memory_order_relaxed);
++  } else if (nonzero) {
++    if (atomic_fetch_add_explicit(&ps5_heap_failures, 1, memory_order_relaxed) < 8 &&
++        sceKernelDebugOutText) {
++      char line[128];
++      snprintf(line, sizeof(line),
++               "[ps5-opengl-heap] mspace refused %zu bytes (live %zu); using the libc heap\n",
++               size, atomic_load_explicit(&ps5_heap_live_bytes, memory_order_relaxed));
++      sceKernelDebugOutText(0, line);
++    }
++  }
++  return address;
++}
++
++static int ps5_heap_ready(void) {
++  int state = atomic_load_explicit(&ps5_heap_state, memory_order_acquire);
++  if (state == 2)
++    return 1;
++  if (state != 0)
++    return 0;
++
++  int expected = 0;
++  if (!atomic_compare_exchange_strong_explicit(
++          &ps5_heap_state, &expected, 1, memory_order_acq_rel,
++          memory_order_acquire))
++    return expected == 2;
++
++  void *base = MAP_FAILED;
++  /* Flexible memory holds only a few hundred MiB; a larger heap comes from
++   * CPU-cached direct memory (the driver's own memory type), mapped CPU-only. */
++  if (ps5_opengl_heap_size > (128u << 20)) {
++    int64_t physical = 0;
++    void *mapped = NULL;
++    const size_t alignment = 2u << 20;
++    const size_t size = (ps5_opengl_heap_size + alignment - 1) & ~(alignment - 1);
++    if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), size, alignment,
++                                      12, &physical) == 0 &&
++        sceKernelMapDirectMemory(&mapped, size, PROT_READ | PROT_WRITE, 0, physical,
++                                 alignment) == 0 && mapped) {
++      base = mapped;
++      ps5_heap_size = size;
++    }
++  }
++  for (size_t size = ps5_opengl_heap_size; base == MAP_FAILED && size >= (128u << 20);
++       size /= 2) {
++    base = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
++    if (base != MAP_FAILED)
++      ps5_heap_size = size;
++  }
++  if (base == MAP_FAILED) {
++    atomic_store_explicit(&ps5_heap_state, -1, memory_order_release);
++    return 0;
++  }
++
++  ps5_heap_base = base;
++  ps5_heap_mspace =
++      sceLibcMspaceCreate("PS5-OpenGL", base, PS5_OPENGL_HEAP_SIZE, 0);
++  if (ps5_heap_mspace == NULL) {
++    ps5_heap_base = NULL;
++    munmap(base, PS5_OPENGL_HEAP_SIZE);
++    atomic_store_explicit(&ps5_heap_state, -1, memory_order_release);
++    return 0;
++  }
++
++  atomic_store_explicit(&ps5_heap_state, 2, memory_order_release);
++  return 1;
++}
++
++size_t __wrap_malloc_usable_size(const void *address);
++
++/* Zero from offset to the end of the block, slack beyond the request included. */
++static void *ps5_heap_zero(void *address, size_t offset, size_t size) {
++  if (ps5_opengl_heap_zero_fill && address) {
++    const size_t usable = __wrap_malloc_usable_size(address);
++    if (usable > size)
++      size = usable;
++    if (size > offset)
++      memset((char *)address + offset, 0, size - offset);
++  }
++  return address;
++}
++
++static int ps5_heap_owns(const void *address) {
++  /* Acquire publication before reading non-atomic heap metadata. */
++  if (atomic_load_explicit(&ps5_heap_state, memory_order_acquire) != 2)
++    return 0;
++  uintptr_t value = (uintptr_t)address;
++  uintptr_t base = (uintptr_t)ps5_heap_base;
++  return value >= base && value - base < PS5_OPENGL_HEAP_SIZE;
++}
++
++/* When the owned heap is exhausted, allocations continue from the libc heap;
++ * free/realloc route by address, so both heaps can hold live blocks. */
++void *__wrap_malloc(size_t size) {
++  void *result = ps5_heap_ready()
++      ? ps5_heap_record_allocation(sceLibcMspaceMalloc(ps5_heap_mspace, size), size)
++      : NULL;
++  return ps5_heap_zero(result ? result : __real_malloc(size), 0, size);
++}
++
++void *__wrap_calloc(size_t count, size_t size) {
++  void *result = ps5_heap_ready()
++      ? ps5_heap_record_allocation(sceLibcMspaceCalloc(ps5_heap_mspace, count, size),
++                                   count * size)
++      : NULL;
++  return result ? result : __real_calloc(count, size);
++}
++
++void *__wrap_realloc(void *address, size_t size) {
++  if (address == NULL)
++    return __wrap_malloc(size);
++  if (!ps5_heap_owns(address)) {
++    const size_t before = ps5_opengl_heap_zero_fill ? __real_malloc_usable_size(address) : 0;
++    return ps5_heap_zero(__real_realloc(address, size), before, size);
++  }
++  size_t before = sceLibcMspaceMallocUsableSize(address);
++  void *result = sceLibcMspaceRealloc(ps5_heap_mspace, address, size);
++  if (result) {
++    ps5_heap_resize_stats(before, sceLibcMspaceMallocUsableSize(result));
++    ps5_heap_zero(result, before, size);
++  } else if (size) {
++    atomic_fetch_add_explicit(&ps5_heap_failures, 1, memory_order_relaxed);
++    /* Move the block to the libc heap; the original stays valid on failure. */
++    result = __real_malloc(size);
++    if (result) {
++      memcpy(result, address, before < size ? before : size);
++      ps5_heap_zero(result, before, size);
++      __wrap_free(address);
++    }
++  } else
++    /* Preserve platform realloc(p,0) behavior; NULL does not tell us whether
++     * p was freed. Mark the counters inconclusive instead of guessing. */
++    atomic_fetch_add_explicit(&ps5_heap_ambiguous_zero_reallocs, 1, memory_order_relaxed);
++  return result;
++}
++
++void __wrap_free(void *address) {
++  if (ps5_heap_owns(address)) {
++    ps5_heap_resize_stats(sceLibcMspaceMallocUsableSize(address), 0);
++    atomic_fetch_sub_explicit(&ps5_heap_blocks, 1, memory_order_relaxed);
++    sceLibcMspaceFree(ps5_heap_mspace, address);
++  } else
++    __real_free(address);
++}
++
++int __wrap_posix_memalign(void **address, size_t alignment, size_t size) {
++  int result;
++  if (!ps5_heap_ready())
++    result = __real_posix_memalign(address, alignment, size);
++  else {
++    result = sceLibcMspacePosixMemalign(ps5_heap_mspace, address, alignment, size);
++    if (result == 0)
++      ps5_heap_record_allocation(*address, size);
++    else if (result == ENOMEM) {
++      atomic_fetch_add_explicit(&ps5_heap_failures, 1, memory_order_relaxed);
++      result = __real_posix_memalign(address, alignment, size);
++    }
++  }
++  if (result == 0)
++    ps5_heap_zero(*address, 0, size);
++  return result;
++}
++
++size_t __wrap_malloc_usable_size(const void *address) {
++  return ps5_heap_owns(address) ? sceLibcMspaceMallocUsableSize(address)
++                                : __real_malloc_usable_size(address);
++}
++
++/* Owned-heap usable bytes, for leak diagnostics in long-running titles. */
++size_t ps5_opengl_heap_live_bytes(void) {
++  return atomic_load_explicit(&ps5_heap_live_bytes, memory_order_relaxed);
++}
++
++void ps5_opengl_heap_stats_print(unsigned iteration) {
++  if (iteration == 0) {
++    int state = atomic_load_explicit(&ps5_heap_state, memory_order_acquire);
++    printf("[ps5-opengl-cts] mspace state=%d base=%p size=%zu\n",
++           state, state == 2 ? ps5_heap_base : NULL, (size_t)PS5_OPENGL_HEAP_SIZE);
++  }
++}
++
++/* The native import converter rejects unresolved weak application symbols.
++ * A diagnostic build's strong definition overrides this default no-op. */
++__attribute__((weak)) void ps5_opengl_gpu_snapshot(const char *phase, unsigned iteration) {
++  (void)phase;
++  (void)iteration;
++}
++void ps5_opengl_heap_snapshot(const char *phase, unsigned iteration) {
++  ps5_opengl_gpu_snapshot(phase, iteration);
++  printf("[ps5-opengl-heap] phase=%s sample=%u state=%d live_bytes=%zu peak_bytes=%zu "
++         "blocks=%zu failures=%zu ambiguous_zero_reallocs=%zu\n", phase, iteration,
++         atomic_load_explicit(&ps5_heap_state, memory_order_acquire),
++         atomic_load_explicit(&ps5_heap_live_bytes, memory_order_relaxed),
++         atomic_load_explicit(&ps5_heap_peak_bytes, memory_order_relaxed),
++         atomic_load_explicit(&ps5_heap_blocks, memory_order_relaxed),
++         atomic_load_explicit(&ps5_heap_failures, memory_order_relaxed),
++         atomic_load_explicit(&ps5_heap_ambiguous_zero_reallocs, memory_order_relaxed));
++}
+diff --git a/engine/platform/ps5/in_ps5.c b/engine/platform/ps5/in_ps5.c
+new file mode 100644
+index 0000000..5814b00
+--- /dev/null
++++ b/engine/platform/ps5/in_ps5.c
+@@ -0,0 +1,267 @@
++/*
++in_ps5.c - PS5 system on-screen keyboard (sceImeDialog) for text input
++Copyright (C) 2026 XashPS5 port
++
++This program is free software: you can redistribute it and/or modify
++it under the terms of the GNU General Public License as published by
++the Free Software Foundation, either version 3 of the License, or
++(at your option) any later version.
++
++ps5-opengl's SDL2 build excludes SDL's video/ps5 keyboard/IME sources, so
++SDL_StartTextInput() does nothing on PS5. Reimplement it the same way the
++PSVita port does: open the system IME dialog whenever the engine enables text
++input (console, chat, menu edit fields) and inject the result as characters.
++Struct layout matches SDL's src/video/ps5/SDL_ps5keyboard.c (PS5 homebrew).
++*/
++
++#include "common.h"
++#include "client.h"
++#include "platform.h"
++#include "keydefs.h"
++
++#if XASH_PS5
++
++#include <string.h>
++#include <stdint.h>
++
++typedef uint16_t ime_wchar_t; // PS5 wchar_t is 16-bit (UTF-16)
++
++typedef int (*SceImeTextFilter)( ime_wchar_t *, uint32_t *, const ime_wchar_t *, uint32_t );
++
++typedef struct
++{
++	int              userId;
++	int              type;               // 0 default, 1 basic latin, 2 url, 3 mail, 4 number
++	uint64_t         supportedLanguages;
++	int              enterLabel;         // 0 default, 1 send, 2 search, 3 go
++	int              inputMethod;
++	SceImeTextFilter filter;
++	uint32_t         option;
++	uint32_t         maxTextLength;
++	ime_wchar_t     *inputTextBuffer;
++	float            posx;
++	float            posy;
++	int              halign;
++	int              valign;
++	const ime_wchar_t *placeholder;
++	const ime_wchar_t *title;
++	int8_t           reserved[16];
++} ps5_ime_param_t;
++
++typedef struct
++{
++	int    outcome; // 0 ok, 1 cancelled, 2 aborted
++	int8_t reserved[12];
++} ps5_ime_result_t;
++
++enum { IME_STATUS_NONE, IME_STATUS_RUNNING, IME_STATUS_FINISHED };
++
++// libSceImeDialog is NOT mapped by the loader for native titles even when it is
++// listed in DT_NEEDED (the crash log module list lacks it, and the first call
++// jumped to rip=1). Load it explicitly and resolve the entry points by hand;
++// if anything fails, text input simply stays disabled instead of crashing.
++int sceKernelLoadStartModule( const char *path, size_t argc, const void *argv, uint32_t flags, void *opt, int *res );
++int sceKernelDlsym( int handle, const char *symbol, void **addr );
++int sceSysmoduleLoadModule( uint16_t id );
++
++static int ( *p_sceImeDialogInit )( const ps5_ime_param_t *param, void *extended );
++static int ( *p_sceImeDialogGetStatus )( void );
++static int ( *p_sceImeDialogGetResult )( ps5_ime_result_t *result );
++static int ( *p_sceImeDialogTerm )( void );
++#define sceImeDialogInit      p_sceImeDialogInit
++#define sceImeDialogGetStatus p_sceImeDialogGetStatus
++#define sceImeDialogGetResult p_sceImeDialogGetResult
++#define sceImeDialogTerm      p_sceImeDialogTerm
++
++static int ime_lib_state; // 0 untried, 1 ok, -1 unavailable
++
++static qboolean IME_LoadLibrary( void )
++{
++	static const char *paths[] =
++	{
++		"/system/common/lib/libSceImeDialog.sprx",
++		"/system_ex/common_ex/lib/libSceImeDialog.sprx",
++		"libSceImeDialog.sprx",
++	};
++	int handle = -1, ret;
++
++	if( ime_lib_state )
++		return ime_lib_state > 0;
++	ime_lib_state = -1;
++
++	// common dialog first (IME dialog depends on it); 0x0095/0x0096 are the
++	// SceSysmodule ids for CommonDialog / ImeDialog
++	ret = sceSysmoduleLoadModule( 0x0095 );
++	Con_Reportf( "IME: sysmodule CommonDialog -> 0x%x\n", ret );
++	ret = sceSysmoduleLoadModule( 0x0096 );
++	Con_Reportf( "IME: sysmodule ImeDialog -> 0x%x\n", ret );
++
++	for( size_t i = 0; i < sizeof( paths ) / sizeof( paths[0] ) && handle < 0; i++ )
++	{
++		handle = sceKernelLoadStartModule( paths[i], 0, NULL, 0, NULL, NULL );
++		Con_Reportf( "IME: load %s -> 0x%x\n", paths[i], handle );
++	}
++	if( handle < 0 )
++	{
++		Con_Printf( S_WARN "IME: libSceImeDialog unavailable, falling back to the built-in on-screen keyboard\n" );
++		Cvar_SetValue( "osk_enable", 1 );
++		return false;
++	}
++
++	{
++		static const char *names[4] = { "sceImeDialogInit", "sceImeDialogGetStatus", "sceImeDialogGetResult", "sceImeDialogTerm" };
++		void **slots[4] = { (void **)&p_sceImeDialogInit, (void **)&p_sceImeDialogGetStatus,
++			(void **)&p_sceImeDialogGetResult, (void **)&p_sceImeDialogTerm };
++		qboolean ok = true;
++
++		for( int i = 0; i < 4; i++ )
++		{
++			*slots[i] = NULL;
++			ret = sceKernelDlsym( handle, names[i], slots[i] );
++			Con_Reportf( "IME: dlsym %s -> 0x%x %p\n", names[i], ret, *slots[i] );
++			if( ret != 0 || !*slots[i] )
++				ok = false;
++		}
++		if( !ok )
++		{
++			Con_Printf( S_WARN "IME: symbol lookup failed, falling back to the built-in on-screen keyboard\n" );
++			Cvar_SetValue( "osk_enable", 1 );
++			return false;
++		}
++	}
++
++	ime_lib_state = 1;
++	Con_Printf( "IME: system keyboard ready\n" );
++	return true;
++}
++
++int sceUserServiceInitialize( void *params );
++int sceUserServiceGetForegroundUser( int *user_id );
++
++#define IME_MAX_TEXT 512
++
++static qboolean    ime_running;
++static qboolean    ime_wanted;    // engine text input is active
++static double      ime_reopen_time;
++static ime_wchar_t ime_text[IME_MAX_TEXT + 1];
++static const ime_wchar_t ime_title[] = { 'X','a','s','h','3','D', 0 };
++
++static void IME_Open( void )
++{
++	ps5_ime_param_t param;
++	int user_id = -1, ret;
++
++	if( ime_running || !IME_LoadLibrary( ))
++		return;
++
++	ret = sceUserServiceInitialize( NULL );
++	if( ret != 0 && ret != (int)0x80960003 ) // already initialised
++		Con_Reportf( S_WARN "IME: sceUserServiceInitialize 0x%x\n", ret );
++
++	ret = sceUserServiceGetForegroundUser( &user_id );
++	if( ret != 0 )
++	{
++		Con_Reportf( S_WARN "IME: no foreground user (0x%x)\n", ret );
++		return;
++	}
++
++	memset( ime_text, 0, sizeof( ime_text ));
++	memset( &param, 0, sizeof( param ));
++	param.userId          = user_id;
++	param.type            = 1; // basic latin: console commands, cvars, IPs
++	param.maxTextLength   = IME_MAX_TEXT;
++	param.inputTextBuffer = ime_text;
++	param.title           = ime_title;
++	param.halign          = 1; // center
++	param.valign          = 2; // bottom
++	param.posx            = 1920.0f;
++	param.posy            = 2100.0f;
++
++	ret = sceImeDialogInit( &param, NULL );
++	if( ret < 0 )
++	{
++		Con_Reportf( S_WARN "IME: sceImeDialogInit failed 0x%x\n", ret );
++		return;
++	}
++	ime_running = true;
++}
++
++static void IME_Close( void )
++{
++	if( !ime_running )
++		return;
++	sceImeDialogTerm();
++	ime_running = false;
++}
++
++void Platform_EnableTextInput( qboolean enable, int x, int y, int w, int h )
++{
++	(void)x; (void)y; (void)w; (void)h;
++
++	ime_wanted = enable;
++	if( enable )
++	{
++		ime_reopen_time = 0.0;
++		IME_Open();
++	}
++	else IME_Close();
++}
++
++static void IME_Deliver( void )
++{
++	for( int i = 0; i < IME_MAX_TEXT && ime_text[i]; i++ )
++	{
++		ime_wchar_t c = ime_text[i];
++		if( c >= 32 && c < 127 )
++			CL_CharEvent( c );
++		else if( c >= 0xA0 && c <= 0xFF )
++			CL_CharEvent( c ); // latin-1 subset; the engine font covers it
++	}
++	// submit the line (console / chat / menu field)
++	Key_Event( K_ENTER, true );
++	Key_Event( K_ENTER, false );
++}
++
++void PS5_InputUpdate( void )
++{
++	int status;
++
++	if( !ime_running )
++	{
++		// console stays open after a command: reopen the keyboard shortly after
++		if( ime_wanted && ime_reopen_time > 0.0 && Platform_DoubleTime() >= ime_reopen_time )
++		{
++			ime_reopen_time = 0.0;
++			IME_Open();
++		}
++		return;
++	}
++
++	status = sceImeDialogGetStatus();
++	if( status != IME_STATUS_FINISHED )
++		return;
++
++	{
++		ps5_ime_result_t result;
++		memset( &result, 0, sizeof( result ));
++		sceImeDialogGetResult( &result );
++		IME_Close();
++
++		if( result.outcome == 0 )
++		{
++			IME_Deliver();
++			// still in a text field (e.g. the console): offer the keyboard again
++			if( ime_wanted )
++				ime_reopen_time = Platform_DoubleTime() + 0.25;
++		}
++		else
++		{
++			// cancelled with Circle: leave the console/field like Escape would
++			ime_wanted = false;
++			Key_Event( K_ESCAPE, true );
++			Key_Event( K_ESCAPE, false );
++		}
++	}
++}
++
++#endif // XASH_PS5
+diff --git a/engine/platform/ps5/ps5_vcwd.c b/engine/platform/ps5/ps5_vcwd.c
+new file mode 100644
+index 0000000..d681bee
+--- /dev/null
++++ b/engine/platform/ps5/ps5_vcwd.c
+@@ -0,0 +1,230 @@
++/*
++ps5_vcwd.c - virtual current working directory for PS5 native titles
++
++Native (BigApp) titles on PS5 are not allowed to chdir() -- the kernel
++returns EPERM ("Changing directory to /app0 failed: Operation not
++permitted", observed on real hardware). Xash3D's filesystem resolves
++everything relative to the cwd ("./valve/..."), so emulate it: every
++path-taking libc call is redirected (via ld --wrap=<sym>) through these
++wrappers, which prefix relative paths with a process-wide virtual cwd.
++*/
++
++#if XASH_PS5
++
++#include <stdarg.h>
++#include <stdio.h>
++#include <string.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <dirent.h>
++#include <unistd.h>
++#include <utime.h>
++#include <sys/stat.h>
++
++static char ps5_vcwd[1024] = "/download0";
++
++static const char *ps5_resolve( const char *path, char *buf, size_t size )
++{
++	if( !path || path[0] == '/' )
++		return path;
++
++	while( path[0] == '.' && path[1] == '/' )
++		path += 2;
++
++	if( !path[0] || ( path[0] == '.' && !path[1] ))
++		snprintf( buf, size, "%s", ps5_vcwd );
++	else
++		snprintf( buf, size, "%s/%s", ps5_vcwd, path );
++
++	return buf;
++}
++
++#define RESOLVE( p ) char p##_buf[1024]; const char *p##_r = ps5_resolve( p, p##_buf, sizeof( p##_buf ))
++
++int __real_stat( const char *path, struct stat *st );
++int __real_lstat( const char *path, struct stat *st );
++int __real_open( const char *path, int flags, ... );
++int __real_access( const char *path, int mode );
++int __real_mkdir( const char *path, mode_t mode );
++int __real_unlink( const char *path );
++int __real_rename( const char *from, const char *to );
++int __real_remove( const char *path );
++int __real_utime( const char *path, const struct utimbuf *times );
++char *__real_realpath( const char *path, char *resolved );
++DIR *__real_opendir( const char *path );
++FILE *__real_fopen( const char *path, const char *mode );
++FILE *__real_freopen( const char *path, const char *mode, FILE *stream );
++
++int __wrap_chdir( const char *path )
++{
++	struct stat st;
++	char tmp[1024];
++	RESOLVE( path );
++
++	if( __real_stat( path_r, &st ) < 0 )
++		return -1;
++
++	if( !S_ISDIR( st.st_mode ))
++	{
++		errno = ENOTDIR;
++		return -1;
++	}
++
++	snprintf( tmp, sizeof( tmp ), "%s", path_r );
++	// strip trailing slashes (keep root "/")
++	for( size_t len = strlen( tmp ); len > 1 && tmp[len - 1] == '/'; len-- )
++		tmp[len - 1] = 0;
++	snprintf( ps5_vcwd, sizeof( ps5_vcwd ), "%s", tmp );
++	return 0;
++}
++
++char *__wrap_getcwd( char *buf, size_t size )
++{
++	if( strlen( ps5_vcwd ) + 1 > size )
++	{
++		errno = ERANGE;
++		return NULL;
++	}
++	memcpy( buf, ps5_vcwd, strlen( ps5_vcwd ) + 1 );
++	return buf;
++}
++
++int __wrap_open( const char *path, int flags, ... )
++{
++	int mode = 0;
++	RESOLVE( path );
++
++	if( flags & O_CREAT )
++	{
++		va_list ap;
++		va_start( ap, flags );
++		mode = va_arg( ap, int );
++		va_end( ap );
++	}
++	return __real_open( path_r, flags, mode );
++}
++
++int __wrap_stat( const char *path, struct stat *st ) { RESOLVE( path ); return __real_stat( path_r, st ); }
++int __wrap_lstat( const char *path, struct stat *st ) { RESOLVE( path ); return __real_stat( path_r, st ); } // native lstat is denied
++int __wrap_access( const char *path, int mode ) { RESOLVE( path ); return __real_access( path_r, mode ); }
++int __wrap_mkdir( const char *path, mode_t mode ) { RESOLVE( path ); return __real_mkdir( path_r, mode ); }
++int __wrap_unlink( const char *path ) { RESOLVE( path ); return __real_unlink( path_r ); }
++int __wrap_remove( const char *path ) { RESOLVE( path ); return __real_remove( path_r ); }
++int __wrap_utime( const char *path, const struct utimbuf *t ) { RESOLVE( path ); return __real_utime( path_r, t ); }
++/*
++ * Native PS5 titles: libc opendir()/readdir() return an empty listing on
++ * real mounts (/app0 lists 0 entries even though stat() succeeds). Read
++ * directories with sceKernelGetdents and a large heap buffer instead,
++ * the same approach as ProsperoEden's headless/native_directory.h.
++ */
++#include <stdlib.h>
++#include <stddef.h>
++#include <stdint.h>
++
++int sceKernelGetdents( int fd, char *buf, int nbytes );
++
++#define PS5_DIRBUF_SIZE 65536
++
++typedef struct ps5_dir_s
++{
++	int fd;
++	int len;
++	int pos;
++	struct dirent ent;
++	char buf[PS5_DIRBUF_SIZE];
++} ps5_dir_t;
++
++DIR *__wrap_opendir( const char *path )
++{
++	ps5_dir_t *d;
++	int fd;
++	RESOLVE( path );
++
++	fd = __real_open( path_r, O_RDONLY | O_DIRECTORY, 0 );
++	if( fd < 0 )
++		return NULL;
++
++	d = calloc( 1, sizeof( *d ));
++	if( !d )
++	{
++		close( fd );
++		errno = ENOMEM;
++		return NULL;
++	}
++	d->fd = fd;
++	return (DIR *)d;
++}
++
++struct dirent *__wrap_readdir( DIR *dirp )
++{
++	ps5_dir_t *d = (ps5_dir_t *)dirp;
++
++	if( !d )
++		return NULL;
++
++	for( ;; )
++	{
++		if( d->pos >= d->len )
++		{
++			d->len = sceKernelGetdents( d->fd, d->buf, sizeof( d->buf ));
++			d->pos = 0;
++			if( d->len <= 0 || d->len > (int)sizeof( d->buf ))
++			{
++				d->len = 0;
++				return NULL;
++			}
++		}
++
++		const size_t name_off = offsetof( struct dirent, d_name );
++		const size_t avail = (size_t)( d->len - d->pos );
++		uint16_t reclen;
++
++		if( avail <= name_off )
++		{
++			d->len = 0;
++			return NULL;
++		}
++
++		memcpy( &reclen, d->buf + d->pos + offsetof( struct dirent, d_reclen ), sizeof( reclen ));
++		if( reclen <= name_off || reclen > avail )
++		{
++			d->len = 0;
++			return NULL;
++		}
++
++		size_t copy = reclen < sizeof( d->ent ) ? reclen : sizeof( d->ent );
++		memset( &d->ent, 0, sizeof( d->ent ));
++		memcpy( &d->ent, d->buf + d->pos, copy );
++		d->ent.d_name[sizeof( d->ent.d_name ) - 1] = 0;
++		d->pos += reclen;
++
++		if( d->ent.d_name[0] == 0 )
++			continue;
++
++		return &d->ent;
++	}
++}
++
++int __wrap_closedir( DIR *dirp )
++{
++	ps5_dir_t *d = (ps5_dir_t *)dirp;
++
++	if( !d )
++		return -1;
++
++	close( d->fd );
++	free( d );
++	return 0;
++}
++FILE *__wrap_fopen( const char *path, const char *mode ) { RESOLVE( path ); return __real_fopen( path_r, mode ); }
++FILE *__wrap_freopen( const char *path, const char *mode, FILE *f ) { RESOLVE( path ); return __real_freopen( path_r, mode, f ); }
++char *__wrap_realpath( const char *path, char *out ) { RESOLVE( path ); return __real_realpath( path_r, out ); }
++
++int __wrap_rename( const char *from, const char *to )
++{
++	RESOLVE( from );
++	RESOLVE( to );
++	return __real_rename( from_r, to_r );
++}
++
++#endif // XASH_PS5
+diff --git a/engine/platform/ps5/s_ps5.c b/engine/platform/ps5/s_ps5.c
+new file mode 100644
+index 0000000..0c74129
+--- /dev/null
++++ b/engine/platform/ps5/s_ps5.c
+@@ -0,0 +1,238 @@
++/*
++s_ps5.c - native PS5 AudioOut sound backend
++Copyright (C) 2026 XashPS5 port
++
++This program is free software: you can redistribute it and/or modify
++it under the terms of the GNU General Public License as published by
++the Free Software Foundation, either version 3 of the License, or
++(at your option) any later version.
++
++ps5-opengl's SDL2 is built without audio (SDL_AUDIO_DISABLED), so drive
++sceAudioOut directly, the same way ProsperoEden's headless/audio.cpp does:
++48 kHz stereo S16, 256-frame grains, one blocking feeder thread that copies
++from the engine's DMA ring buffer (same model as the SDL2 callback backend).
++*/
++
++#include "common.h"
++#include "platform.h"
++#include "sound.h"
++#include "voice.h"
++
++#if XASH_PS5
++
++#include <pthread.h>
++#include <string.h>
++#include <stdint.h>
++
++int sceAudioOutInit( void );
++int sceAudioOutOpen( int user_id, int type, int index, unsigned int length, unsigned int frequency, unsigned int format );
++int sceAudioOutClose( int handle );
++int sceAudioOutOutput( int handle, const void *samples );
++int sceAudioOutSetVolume( int handle, int flags, const int *volumes );
++
++#define PS5_AUDIO_GRAIN     256       // frames per sceAudioOutOutput call
++#define PS5_AUDIO_RATE      48000
++#define PS5_AUDIO_S16_STEREO 1
++#define PS5_AUDIO_USER_SYSTEM 0xff    // SCE_USER_SERVICE_USER_ID_SYSTEM
++#define PS5_AUDIO_TYPE_MAIN 0
++#define PS5_AUDIO_VOLUME_0DB 32768
++
++static int             ps5_audio_handle = -1;
++static pthread_t       ps5_audio_thread;
++static pthread_mutex_t ps5_audio_lock = PTHREAD_MUTEX_INITIALIZER;
++static volatile int    ps5_audio_running;
++static volatile int    ps5_audio_active;
++static short           ps5_audio_block[PS5_AUDIO_GRAIN * 2];
++
++// The mixer runs at SOUND_DMA_SPEED (44.1 kHz; several engine paths hardcode
++// it), while AudioOut only takes 48 kHz: resample in the feeder thread.
++#define PS5_MIX_RATE  SOUND_DMA_SPEED
++#define PS5_RS_STEP   ((uint32_t)((((uint64_t)PS5_MIX_RATE) << 16) / PS5_AUDIO_RATE))
++#define PS5_IN_MAX    1024
++
++static short    ps5_in[PS5_IN_MAX][2];
++static int      ps5_in_count;
++static uint32_t ps5_in_pos; // 16.16 position in ps5_in
++
++// pull frames from the engine DMA ring (lock held)
++static void PS5_PullFrames( int frames )
++{
++	const int ring = snd.samples; // in samples (frames * 2)
++	short *src = (short *)snd.buffer;
++
++	if( ps5_in_count + frames > PS5_IN_MAX )
++		frames = PS5_IN_MAX - ps5_in_count;
++
++	for( int i = 0; i < frames; i++ )
++	{
++		if( snd.samplepos >= ring )
++			snd.samplepos = 0;
++		ps5_in[ps5_in_count][0] = src[snd.samplepos];
++		ps5_in[ps5_in_count][1] = src[snd.samplepos + 1];
++		snd.samplepos += 2;
++		ps5_in_count++;
++	}
++	if( snd.samplepos >= ring )
++		snd.samplepos = 0;
++}
++
++static void PS5_FillBlock( void )
++{
++	pthread_mutex_lock( &ps5_audio_lock );
++
++	if( !ps5_audio_active || !snd.buffer || snd.samples <= 0 )
++	{
++		memset( ps5_audio_block, 0, sizeof( ps5_audio_block ));
++		pthread_mutex_unlock( &ps5_audio_lock );
++		return;
++	}
++
++	for( int i = 0; i < PS5_AUDIO_GRAIN; i++ )
++	{
++		int k = ps5_in_pos >> 16;
++		int f = ps5_in_pos & 0xffff;
++
++		while( k + 1 >= ps5_in_count )
++			PS5_PullFrames( 64 );
++
++		for( int c = 0; c < 2; c++ )
++		{
++			int a = ps5_in[k][c], b = ps5_in[k + 1][c];
++			ps5_audio_block[i * 2 + c] = (short)( a + ((( b - a ) * f ) >> 16 ));
++		}
++		ps5_in_pos += PS5_RS_STEP;
++	}
++
++	{
++		int drop = ps5_in_pos >> 16;
++		if( drop > ps5_in_count )
++			drop = ps5_in_count;
++		memmove( ps5_in, ps5_in[drop], ( ps5_in_count - drop ) * sizeof( ps5_in[0] ));
++		ps5_in_count -= drop;
++		ps5_in_pos -= (uint32_t)drop << 16;
++	}
++
++	pthread_mutex_unlock( &ps5_audio_lock );
++}
++
++static void *PS5_AudioThread( void *arg )
++{
++	(void)arg;
++
++	while( ps5_audio_running )
++	{
++		PS5_FillBlock();
++
++		// blocks until the hardware consumed the previous grain (paces us at 48 kHz)
++		if( sceAudioOutOutput( ps5_audio_handle, ps5_audio_block ) < 0 )
++			break;
++	}
++
++	return NULL;
++}
++
++qboolean SNDDMA_Init( void )
++{
++	static int audio_inited;
++	int samplecount, ret;
++	int volumes[8];
++
++	if( !audio_inited )
++	{
++		ret = sceAudioOutInit();
++		// a second init reports "already initialised"; the first one is what matters
++		audio_inited = 1;
++		if( ret < 0 )
++			Con_Reportf( "Audio: sceAudioOutInit returned 0x%x (continuing)\n", ret );
++	}
++
++	ps5_audio_handle = sceAudioOutOpen( PS5_AUDIO_USER_SYSTEM, PS5_AUDIO_TYPE_MAIN, 0,
++		PS5_AUDIO_GRAIN, PS5_AUDIO_RATE, PS5_AUDIO_S16_STEREO );
++
++	if( ps5_audio_handle < 0 )
++	{
++		Con_Printf( S_ERROR "Audio: sceAudioOutOpen failed 0x%x\n", ps5_audio_handle );
++		ps5_audio_handle = -1;
++		return false;
++	}
++
++	for( int i = 0; i < 8; i++ )
++		volumes[i] = PS5_AUDIO_VOLUME_0DB;
++	sceAudioOutSetVolume( ps5_audio_handle, 3, volumes ); // left | right
++
++	snd.format.speed    = PS5_MIX_RATE; // resampled to 48 kHz in PS5_FillBlock
++	snd.format.channels = 2;
++	snd.format.width    = 2;
++	samplecount = s_samplecount.value;
++	if( !samplecount )
++		samplecount = 0x2000; // ~170 ms ring at 48 kHz: low latency, still safe
++	snd.samples   = samplecount * 2;
++	snd.buffer    = Mem_Calloc( sndpool, snd.samples * 2 );
++	snd.samplepos = 0;
++	ps5_in_count = 0;
++	ps5_in_pos = 0;
++
++	snd.initialized  = true;
++	snd.backend_name = "PS5 AudioOut";
++
++	ps5_audio_active = 1;
++	ps5_audio_running = 1;
++	if( pthread_create( &ps5_audio_thread, NULL, PS5_AudioThread, NULL ) != 0 )
++	{
++		Con_Printf( S_ERROR "Audio: can't create feeder thread\n" );
++		ps5_audio_running = 0;
++		SNDDMA_Shutdown();
++		return false;
++	}
++
++	Con_Printf( "Using PS5 AudioOut: mix %d Hz -> out %d Hz, %d-frame grain\n", PS5_MIX_RATE, PS5_AUDIO_RATE, PS5_AUDIO_GRAIN );
++	return true;
++}
++
++void SNDDMA_BeginPainting( void )
++{
++	pthread_mutex_lock( &ps5_audio_lock );
++}
++
++void SNDDMA_Submit( void )
++{
++	pthread_mutex_unlock( &ps5_audio_lock );
++}
++
++void SNDDMA_Activate( qboolean active )
++{
++	ps5_audio_active = active ? 1 : 0;
++}
++
++void SNDDMA_Shutdown( void )
++{
++	Con_Printf( "Shutting down audio.\n" );
++	snd.initialized = false;
++
++	if( ps5_audio_running )
++	{
++		ps5_audio_running = 0;
++		pthread_join( ps5_audio_thread, NULL );
++	}
++
++	if( ps5_audio_handle >= 0 )
++	{
++		sceAudioOutOutput( ps5_audio_handle, NULL ); // drain
++		sceAudioOutClose( ps5_audio_handle );
++		ps5_audio_handle = -1;
++	}
++
++	if( snd.buffer )
++	{
++		Mem_Free( snd.buffer );
++		snd.buffer = NULL;
++	}
++}
++
++// no microphone support
++qboolean VoiceCapture_Init( void ) { return false; }
++qboolean VoiceCapture_Activate( qboolean activate ) { (void)activate; return false; }
++qboolean VoiceCapture_Lock( qboolean lock ) { (void)lock; return false; }
++void VoiceCapture_Shutdown( void ) { }
++
++#endif // XASH_PS5
+diff --git a/engine/platform/ps5/sys_ps5.c b/engine/platform/ps5/sys_ps5.c
+new file mode 100644
+index 0000000..6029649
+--- /dev/null
++++ b/engine/platform/ps5/sys_ps5.c
+@@ -0,0 +1,101 @@
++/*
++sys_ps5.c - PS5 homebrew platform backend
++Copyright (C) 2026
++
++This program is free software: you can redistribute it and/or modify
++it under the terms of the GNU General Public License as published by
++the Free Software Foundation, either version 3 of the License, or
++(at your option) any later version.
++
++This program is distributed in the hope that it will be useful,
++but WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++GNU General Public License for more details.
++
++---
++
++Target stack (verified against upstream repos, 2026-10-03):
++  - toolchain + libc:  ps5-payload-dev/sdk  (clang/lld, real libc, native
++    folder-app packaging via ps5-native-app-boilerplate)
++  - GL:                blackbearreloaded/ps5-opengl (OpenGL 4.6 Core / EGL,
++    Mesa+Gallium backed, CTS-passing) with its SDL2 video driver "G19"
++    (integration/SDL2/SDL_ps5g19.c) -- this is what lets Xash3D reuse its
++    existing engine/platform/sdl2 + ref/gl backends almost unmodified.
++  - Vulkan (future):   mihawk-99/PS5_Vulkan + PS5_Mesa (RADV port). Not
++    targeted by this first pass -- ref/gl (OpenGL) is the nearer path given
++    the existing Xash3D GL renderer and the SDL2 bridge above.
++
++This file intentionally stays thin: most logic should live in
++engine/platform/sdl2/*.c once the SDL2 "G19" driver is linked in for
++DEST_OS == 'ps5'. Anything here is for PS5-only concerns that have no SDL
++equivalent (base path resolution inside the native app folder, and any
++console-specific lifecycle hooks the native app boilerplate requires).
++*/
++
++#include "platform/platform.h"
++
++#if XASH_PS5
++
++#include <stdio.h>
++#include <string.h>
++
++/*
++========================
++PS5_Init
++
++Called once from Host code at startup, before the SDL2 video/audio
++backends are brought up. On PS5 this is where we'd register with the
++native app boilerplate's lifecycle (suspend/resume callbacks) once that
++integration is written; left as a stub until the boilerplate headers are
++wired into the build.
++========================
++*/
++void PS5_Init( void )
++{
++	// TODO: hook ps5-native-app-boilerplate lifecycle (suspend/resume),
++	// once Makefile/toolchain integration lands.
++}
++
++/*
++========================
++PS5_Shutdown
++========================
++*/
++void PS5_Shutdown( void )
++{
++}
++
++/*
++========================
++PS5_GetBasePath
++
++Native folder apps on PS5 run from a fixed, read-only app0-style mount
++(see ps5-opengl docs/consumer-build.md: titles are uploaded to
++/data/homebrew/<TITLEID> and launched as a registered title, not an ELF
++payload). Until the boilerplate's path helpers are wired in, hardcode the
++expected layout; this must be revisited once the native app boilerplate
++integration is in place.
++========================
++*/
++qboolean PS5_GetBasePath( char *buf, const size_t buflen )
++{
++	// Native folder apps are launched with their title's package mounted
++	// read-only at /app0 (confirmed against ps5-native-app-boilerplate's
++	// docs/PLATFORM_NOTES.md: "/app0 is the read-only application image").
++	// The earlier placeholder, "/data/homebrew/current", does not exist on
++	// a real console (ShadowMountPlus mounts titles under
++	// /system_ex/app/<TITLEID>, not a stable "current" alias) -- Xash3D's
++	// filesystem layer would fail to find valve/ under that bogus path.
++	// /app0 (package, read-only) is passed as the read-only root instead
++	// (see FS_DetermineReadOnlyRootDirectory); the writable root is the
++	// per-title /download0 mount (downloadDataSize > 0 in param.json), so
++	// config.cfg, saves and logs can be written.
++	Q_strncpy( buf, "/download0", buflen );
++	return true;
++}
++
++/* Override ps5-opengl app_heap.c's weak 128 MiB default: Xash3D + Half-Life
++ * data needs far more; >128 MiB is served from CPU-cached direct memory. */
++const size_t ps5_opengl_heap_size = 1024u * 1024u * 1024u;
++
++#endif // XASH_PS5
+diff --git a/engine/platform/sdl2/host_sdl2.c b/engine/platform/sdl2/host_sdl2.c
+index fbcc883..472fe9c 100644
+--- a/engine/platform/sdl2/host_sdl2.c
++++ b/engine/platform/sdl2/host_sdl2.c
+@@ -436,6 +436,9 @@ void Platform_RunEvents( void )
+ #if XASH_PSVITA
+ 	PSVita_InputUpdate();
+ #endif
++#if XASH_PS5
++	PS5_InputUpdate();
++#endif
+ }
+ 
+ /*
+diff --git a/engine/platform/sdl2/in_sdl2.c b/engine/platform/sdl2/in_sdl2.c
+index 6d66e09..b92a682 100644
+--- a/engine/platform/sdl2/in_sdl2.c
++++ b/engine/platform/sdl2/in_sdl2.c
+@@ -183,6 +183,7 @@ SDLash_EnableTextInput
+ 
+ =============
+ */
++#if !XASH_PS5 // PS5: system IME dialog in platform/ps5/in_ps5.c
+ void Platform_EnableTextInput( qboolean enable, int x, int y, int w, int h )
+ {
+ 	if( !enable )
+@@ -204,6 +205,7 @@ void Platform_EnableTextInput( qboolean enable, int x, int y, int w, int h )
+ 	SDL_SetTextInputRect( &rect );
+ 	SDL_StartTextInput();
+ }
++#endif // !XASH_PS5
+ 
+ #endif // !XASH_PSVITA
+ 
+diff --git a/engine/platform/sdl2/joy_sdl2.c b/engine/platform/sdl2/joy_sdl2.c
+index 99d45b0..653586c 100644
+--- a/engine/platform/sdl2/joy_sdl2.c
++++ b/engine/platform/sdl2/joy_sdl2.c
+@@ -363,7 +363,12 @@ void Platform_Vibrate2( float time, int val1, int val2, uint flags )
+ 		val2 = COM_RandomLong( 0x7FFF, 0xFFFF );
+ 
+ 	Uint32 ms = (Uint32)ceil( time );
+-	SDL_GameControllerRumble( gc, val1, val2, ms );
++	if( SDL_GameControllerRumble( gc, val1, val2, ms ) != 0 )
++	{
++		static int reported;
++		if( reported++ < 5 )
++			Con_Printf( S_WARN "Rumble failed: %s\n", SDL_GetError( ));
++	}
+ #endif // SDL_VERSION_ATLEAST( 2, 0, 9 )
+ }
+ 
+diff --git a/engine/platform/sdl2/vid_sdl2.c b/engine/platform/sdl2/vid_sdl2.c
+index e85afd2..b073731 100644
+--- a/engine/platform/sdl2/vid_sdl2.c
++++ b/engine/platform/sdl2/vid_sdl2.c
+@@ -661,6 +661,20 @@ VID_CreateWindow
+ static rserr_t VID_CreateWindow( const int input_width, const int input_height, window_mode_t window_mode )
+ {
+ 	rserr_t err;
++#if XASH_PS5
++	// ps5-opengl's SDL2 "G19" driver's create_window() hard-rejects any
++	// window that isn't exactly PS5_OPENGL_NATIVE_WIDTH x _HEIGHT (1920x
++	// 1080) with ONLY SDL_WINDOW_OPENGL set -- SDL_WINDOW_RESIZABLE (always
++	// added below for every other platform), SDL_WINDOW_ALLOW_HIGHDPI, or
++	// SDL_WINDOW_MAXIMIZED each independently fail the check and return
++	// NULL from SDL_CreateWindow with no further diagnostic reaching the
++	// engine (see integration/SDL2/SDL_ps5g19.c create_window()).
++	Uint32 flags = SDL_WINDOW_HIDDEN;
++	SDL_Rect rect = { SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1920, 1080 };
++
++	if( !glw_state.software )
++		SetBits( flags, SDL_WINDOW_OPENGL );
++#else
+ 	Uint32 flags = SDL_WINDOW_HIDDEN | SDL_WINDOW_RESIZABLE;
+ 	SDL_Rect rect = { SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, input_width, input_height };
+ 
+@@ -674,6 +688,7 @@ static rserr_t VID_CreateWindow( const int input_width, const int input_height,
+ 
+ 	if( vid_maximized.value )
+ 		SetBits( flags, SDL_WINDOW_MAXIMIZED );
++#endif // XASH_PS5
+ 
+ 	// by default we create window in windowed mode because we don't know
+ 	// if window creation failed because of invalid video mode or any other reason
+@@ -801,7 +816,14 @@ static void GL_SetupAttributes( void )
+ 
+ void GL_SwapBuffers( void )
+ {
++#if XASH_PS5
++	extern double ps5_prof_swap;
++	double t0 = Platform_DoubleTime();
+ 	SDL_GL_SwapWindow( host.hWnd );
++	ps5_prof_swap += Platform_DoubleTime() - t0;
++#else
++	SDL_GL_SwapWindow( host.hWnd );
++#endif
+ }
+ 
+ int GL_SetAttribute( int attr, int val )
+diff --git a/engine/wscript b/engine/wscript
+index 791b9d2..9dfc372 100644
+--- a/engine/wscript
++++ b/engine/wscript
+@@ -115,6 +115,32 @@ def configure(conf):
+ 
+ 			if conf.env.DEST_OS == 'nswitch': # remove libstdc++ linking from SDL2, we link it later
+ 				conf.env.LIB_SDL2.remove('stdc++')
++		elif conf.env.DEST_OS == 'ps5':
++			# ps5-opengl ships its own SDL2 ("G19" video driver) that calls
++			# EGL (libPS5OpenGL.a) and Sce pad/user-service APIs the base
++			# PS5 payload SDK doesn't provide; temporarily extend LDFLAGS
++			# with ps5-opengl's own pkg-config recipe
++			# (lib/pkgconfig/ps5-opengl.pc) for the duration of the SDL2
++			# sanity check, same pattern as nswitch/psvita above.
++			gl_lib = os.environ.get('PS5_OPENGL_SDK', '') + '/lib'
++			extra_libs = [
++				'-Wl,-u,ps5_agc_gate2_run',
++				'-Wl,--start-group', '-lPS5OpenGL', '-Wl,--end-group',
++				gl_lib + '/libSceAgc.so', gl_lib + '/libSceAgcDriver.so',
++				'-lSceVideoOut', '-lkernel', '-lSceSystemService',
++				'-lScePad', '-lSceUserService', '-lSceSysmodule',
++				# libPS5OpenGL.a embeds C++ (Mesa/ACO); the sanity check
++				# links with the C driver (prospero-clang), so libc++ must
++				# be pulled in explicitly or std:: symbols stay undefined.
++				'-lc++', '-lc++abi', '-lunwind',
++			]
++			conf.env.LDFLAGS += extra_libs
++			find_sdl(conf)
++			for lib in extra_libs: conf.env.LDFLAGS.remove(lib)
++			# keep them on LIB_SDL2's use list so the real engine link (not
++			# just this sanity check) also pulls them in
++			conf.env.STLIB_SDL2 = conf.env.STLIB_SDL2 or []
++			conf.env.LINKFLAGS_SDL2 = (conf.env.LINKFLAGS_SDL2 or []) + extra_libs
+ 		elif conf.env.DEST_OS == 'linux' and conf.options.FBDEV_SW:
+ 			conf.check_cc(lib='asound')
+ 		elif conf.options.SDL12: # TODO: move to sdl2.py
+@@ -262,7 +288,8 @@ def build(bld):
+ 		defines = []
+ 		if bld.env.XASH_SDL:
+ 			libs += ['SDL%d' % bld.env.XASH_SDL]
+-			source += bld.path.ant_glob(['platform/sdl%d/*.c' % bld.env.XASH_SDL])
++			source += bld.path.ant_glob(['platform/sdl%d/*.c' % bld.env.XASH_SDL],
++				excl = ['platform/sdl%d/s_sdl%d.c' % (bld.env.XASH_SDL, bld.env.XASH_SDL)] if bld.env.DEST_OS == 'ps5' else [])
+ 			defines += ['XASH_SDL=%d' % bld.env.XASH_SDL]
+ 
+ 		if bld.get_define('HAVE_FFMPEG'):
+@@ -295,9 +322,28 @@ def build(bld):
+ 
+ 		if bld.env.DEST_OS in ['nswitch', 'psvita', 'emscripten']:
+ 			install_path = None
++		elif bld.env.DEST_OS == 'ps5':
++			# packaged as a native homebrew folder app, not installed via
++			# the host build's install_path mechanism
++			install_path = None
+ 
+ 		linkflags = []
+ 
++		if bld.env.DEST_OS == 'ps5':
++			# PS5 native titles get EPERM from chdir(); platform/ps5/ps5_vcwd.c
++			# emulates a virtual cwd by wrapping every path-taking libc call.
++			# Only on the final xash link (configure test programs lack the wrappers).
++			for sym in ('chdir', 'getcwd', 'open', 'stat', 'lstat', 'access', 'mkdir', 'unlink',
++				'rename', 'remove', 'utime', 'opendir', 'readdir', 'closedir', 'fopen', 'freopen', 'realpath',
++				# ps5-opengl native-app/app_heap.c: app-owned heap; the libc heap of a
++				# native title is tiny (Xash hit OOM on a 535 KB alloc). The complete
++				# wrap set is mandatory (see ps5-opengl docs/consumer-build.md).
++				'malloc', 'calloc', 'realloc', 'free', 'posix_memalign', 'malloc_usable_size'):
++				linkflags += ['-Wl,--wrap=' + sym]
++
++		if bld.env.DEST_OS == 'ps5':
++			linkflags += ['-lSceAudioOut', '-lSceUserService', '-lSceSysmodule'] # platform/ps5/s_ps5.c, in_ps5.c
++
+ 		if bld.env.DEST_OS == 'emscripten':
+ 			linkflags = ['-sINITIAL_MEMORY=134217728', '-sALLOW_MEMORY_GROWTH=1', '-sSTACK_SIZE=16777216']
+ 
+diff --git a/filesystem/exports.txt b/filesystem/exports.txt
+index b520b53..ce0a40b 100644
+--- a/filesystem/exports.txt
++++ b/filesystem/exports.txt
+@@ -1 +1,2 @@
+ GetFSAPI
++CreateInterface
+diff --git a/filesystem/gameinfo.c b/filesystem/gameinfo.c
+index 2c1ed0f..31249c2 100644
+--- a/filesystem/gameinfo.c
++++ b/filesystem/gameinfo.c
+@@ -23,6 +23,11 @@ GNU General Public License for more details.
+ #include "crtlib.h"
+ #include "filesystem.h"
+ #include "filesystem_internal.h"
++#if XASH_PS5
++#include <stdio.h>
++extern int sceKernelDebugOutText( int channel, const char *text );
++#define PS5DIAG( ... ) do { char _d[1024]; snprintf( _d, sizeof( _d ), __VA_ARGS__ ); sceKernelDebugOutText( 0, _d ); } while( 0 )
++#endif
+ #include "xash3d_mathlib.h"
+ #include "common/com_strings.h"
+ #include "common/protocol.h"
+@@ -648,6 +653,15 @@ qboolean FS_ParseGameInfo( const char *gamedir, gameinfo_t *GameInfo, qboolean r
+ 	else
+ 		Q_snprintf( gamedir_path, sizeof( gamedir_path ), "%s", gamedir );
+ 
++#if XASH_PS5
++	{
++		char a[MAX_SYSPATH], b[MAX_SYSPATH];
++		Q_snprintf( a, sizeof( a ), "%s/liblist.gam", gamedir_path );
++		Q_snprintf( b, sizeof( b ), "%s/gameinfo.txt", gamedir_path );
++		PS5DIAG( "[XASH] PS5DIAG ParseGameInfo '%s' rodir=%d liblist exists=%d time=%d gameinfo exists=%d\n",
++			gamedir_path, rodir, FS_SysFileExists( a ), FS_SysFileTime( a ), FS_SysFileExists( b ));
++	}
++#endif
+ 	if( !FS_CheckForXashGameDir( gamedir_path ))
+ 	{
+ 		// check if we need to generate gameinfo for Quake
+diff --git a/filesystem/searchpath.c b/filesystem/searchpath.c
+index 6ffbd4b..ed7d783 100644
+--- a/filesystem/searchpath.c
++++ b/filesystem/searchpath.c
+@@ -18,11 +18,17 @@ GNU General Public License for more details.
+ 
+ #include "build.h"
+ #include <stdlib.h>
++#include <sys/stat.h>
+ #include "port.h"
+ #include "defaults.h"
+ #include "crtlib.h"
+ #include "filesystem.h"
+ #include "filesystem_internal.h"
++#if XASH_PS5
++#include <stdio.h>
++extern int sceKernelDebugOutText( int channel, const char *text );
++#define PS5DIAG( ... ) do { char _d[1024]; snprintf( _d, sizeof( _d ), __VA_ARGS__ ); sceKernelDebugOutText( 0, _d ); } while( 0 )
++#endif
+ #include "common/com_strings.h"
+ #include "library_suffix.h"
+ 
+@@ -499,7 +505,10 @@ void FS_LoadGameInfo( uint32_t flags, const char *language )
+ 	}
+ 
+ 	if( i == FI.numgames )
+-		Sys_Error( "Couldn't find game directory '%s'\n", fs_gamedir );
++	{
++		for( int k = 0; k < FI.numgames; k++ ) PS5DIAG( "[XASH] PS5DIAG known game '%s'\n", FI.games[k]->gamefolder );
++		Sys_Error( "Couldn't find game directory '%s' (numgames=%d)\n", fs_gamedir, FI.numgames );
++	}
+ 
+ 	FI.GameInfo = FI.games[i];
+ 
+@@ -657,6 +666,23 @@ qboolean FS_InitStdio( qboolean unused_set_to_true, const char *rootdir, const c
+ 		stringlistinit( &dirs );
+ 		listdirectory( &dirs, fs_rodir, true );
+ 		stringlistsort( &dirs );
++#if XASH_PS5
++		{
++			struct stat st;
++			int r1 = stat( fs_rodir, &st );
++			PS5DIAG( "[XASH] PS5DIAG rodir=%s rootdir=%s gamedir=%s stat=%d mode=%o ndirs=%d\n", fs_rodir, fs_rootdir, fs_gamedir, r1, r1 == 0 ? (unsigned)st.st_mode : 0, dirs.numstrings );
++			for( int k = 0; k < dirs.numstrings && k < 16; k++ )
++			{
++				char b[MAX_SYSPATH];
++				Q_snprintf( b, sizeof( b ), "%s/%s", fs_rodir, dirs.strings[k] );
++				PS5DIAG( "[XASH] PS5DIAG  entry '%s' folder=%d\n", dirs.strings[k], FS_SysFolderExists( b ));
++			}
++			stringlist_t all; stringlistinit( &all ); listdirectory( &all, fs_rodir, false );
++			PS5DIAG( "[XASH] PS5DIAG all entries=%d\n", all.numstrings );
++			for( int k = 0; k < all.numstrings && k < 16; k++ ) PS5DIAG( "[XASH] PS5DIAG  any '%s'\n", all.strings[k] );
++			stringlistfreecontents( &all );
++		}
++#endif
+ 
+ 		for( int i = 0; i < dirs.numstrings; i++ )
+ 		{
+diff --git a/ref/gl/gl2_shim/gl2_shim.c b/ref/gl/gl2_shim/gl2_shim.c
+index 91541c9..3fb693d 100644
+--- a/ref/gl/gl2_shim/gl2_shim.c
++++ b/ref/gl/gl2_shim/gl2_shim.c
+@@ -101,6 +101,7 @@ static struct
+ 	gl2wrap_prog_t *cur_prog;
+ 	GLboolean uchanged;
+ 	GLuint triquads_ibo[4];
++	GLuint trifan_ibo; // PS5: fan -> triangle list (0,1,2, 0,2,3, ...)
+ } gl2wrap;
+ 
+ static struct
+@@ -462,6 +463,25 @@ static void GL2_InitTriQuads( void )
+ 		pglBufferDataARB( GL_ELEMENT_ARRAY_BUFFER_ARB, sizeof( triquads_array ), triquads_array, GL_STATIC_DRAW_ARB );
+ 	}
+ 
++#if XASH_PS5
++	// The PS5 GL driver only batches indexed GL_TRIANGLES draws backed by a
++	// buffer; TRIANGLE_FAN / POLYGON / single-quad draws (the bulk of
++	// Half-Life's immediate-mode output) each fall back to a synchronous
++	// GPU submission (~0.42 ms per draw measured on hardware). Feed them
++	// through a static fan->list index buffer instead.
++	{
++		static GLushort fan_array[( MAX_BEGINEND_VERTS - 2 ) * 3];
++		for( int j = 0; j < MAX_BEGINEND_VERTS - 2; j++ )
++		{
++			fan_array[j * 3] = 0;
++			fan_array[j * 3 + 1] = j + 1;
++			fan_array[j * 3 + 2] = j + 2;
++		}
++		pglGenBuffersARB( 1, &gl2wrap.trifan_ibo );
++		rpglBindBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB, gl2wrap.trifan_ibo );
++		pglBufferDataARB( GL_ELEMENT_ARRAY_BUFFER_ARB, sizeof( fan_array ), fan_array, GL_STATIC_DRAW_ARB );
++	}
++#endif
+ 	rpglBindBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB, 0 );
+ }
+ 
+@@ -868,7 +888,30 @@ static void GL2_UpdateIncrementalBuffer( gl2wrap_prog_t *prog, int count )
+ 	}
+ }
+ 
++#if XASH_PS5
++// PS5 perf probe: draw calls and time inside GL2_FlushPrims, read by the engine
++// counters live in the engine (ref_gl is a static module with a stripped
++// export table); resolved through the engine's own exported helper
++extern double *PS5Prof_Counters( void ) __attribute__((weak));
++static double ps5_dummy[8];
++#define ps5_shim_flush_time  ( PS5Prof_Counters ? PS5Prof_Counters() : ps5_dummy )[0]
++#define ps5_shim_flush_count ( PS5Prof_Counters ? PS5Prof_Counters() : ps5_dummy )[1]
++#define ps5_shim_flush_verts ( PS5Prof_Counters ? PS5Prof_Counters() : ps5_dummy )[2]
++#define ps5_shim_array_time  ( PS5Prof_Counters ? PS5Prof_Counters() : ps5_dummy )[3]
++#define ps5_shim_array_count ( PS5Prof_Counters ? PS5Prof_Counters() : ps5_dummy )[4]
++static void GL2_FlushPrims_Real( void );
+ static void GL2_FlushPrims( void )
++{
++	double t0 = gEngfuncs.pfnTime();
++	ps5_shim_flush_count++;
++	ps5_shim_flush_verts += gl2wrap.end - gl2wrap.begin;
++	GL2_FlushPrims_Real();
++	ps5_shim_flush_time += gEngfuncs.pfnTime() - t0;
++}
++static void GL2_FlushPrims_Real( void )
++#else
++static void GL2_FlushPrims( void )
++#endif
+ {
+ 	int startindex = 0;
+ 	GLuint flags = gl2wrap.cur_flags;
+@@ -948,6 +991,17 @@ static void GL2_FlushPrims( void )
+ 		gl2wrap.attrbufcycle = ( gl2wrap.attrbufcycle + 1 ) % gl2wrap_config.cycle_buffers;
+ 	}
+ 
++#if XASH_PS5
++	if(( gl2wrap.prim == GL_TRIANGLE_FAN || gl2wrap.prim == GL_POLYGON || ( gl2wrap.prim == GL_QUADS && count == 4 ))
++		&& count >= 3 && count <= MAX_BEGINEND_VERTS && pglDrawRangeElementsBaseVertex && gl2wrap.trifan_ibo )
++	{
++		pglBindBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB, gl2wrap.trifan_ibo );
++		pglDrawRangeElementsBaseVertex( GL_TRIANGLES, 0, count - 1, ( count - 2 ) * 3,
++			GL_UNSIGNED_SHORT, NULL, startindex );
++		pglBindBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB, 0 );
++	}
++	else
++#endif
+ 	if( gl2wrap.prim == GL_QUADS )
+ 	{
+ 		// simple case, one quad may draw like polygon(4)
+@@ -1700,19 +1754,93 @@ static void GL2_SetupArrays( GLuint start, GLuint end )
+ 	rpglBindBufferARB( GL_ARRAY_BUFFER_ARB, gl2wrap_state.vbo );
+ }
+ 
++#if XASH_PS5
++#define PS5_ARRAY_BEGIN double ps5_t0 = gEngfuncs.pfnTime(); ps5_shim_array_count++;
++#define PS5_ARRAY_END ps5_shim_array_time += gEngfuncs.pfnTime() - ps5_t0;
++#else
++#define PS5_ARRAY_BEGIN
++#define PS5_ARRAY_END
++#endif
++#if XASH_PS5
++// The PS5 driver only batches draws whose indices live in a buffer object
++// ("has_user_indices" disqualifies). Stream client-side index arrays into an
++// orphaned element buffer so world/model DrawRangeElements calls batch too.
++static GLuint ps5_index_ibo;
++static size_t ps5_index_offset;
++#define PS5_INDEX_IBO_SIZE ( 4u << 20 )
++
++static qboolean PS5_StreamIndices( GLsizei count, GLenum type, const GLvoid **indices_inout )
++{
++	const GLvoid *indices = *indices_inout;
++	GLint bound = 0;
++	size_t isize = type == GL_UNSIGNED_INT ? 4 : type == GL_UNSIGNED_SHORT ? 2 : 1;
++	size_t bytes = (size_t)count * isize;
++	void *mem;
++
++	pglGetIntegerv( GL_ELEMENT_ARRAY_BUFFER_BINDING_ARB, &bound );
++	if( bound || !indices || type == GL_UNSIGNED_BYTE || bytes > PS5_INDEX_IBO_SIZE || !pglMapBufferRange )
++		return false; // already a buffer offset, or unsupported: leave the call untouched
++
++	if( !ps5_index_ibo )
++	{
++		pglGenBuffersARB( 1, &ps5_index_ibo );
++		rpglBindBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB, ps5_index_ibo );
++		pglBufferDataARB( GL_ELEMENT_ARRAY_BUFFER_ARB, PS5_INDEX_IBO_SIZE, NULL, GL_STREAM_DRAW_ARB );
++		ps5_index_offset = PS5_INDEX_IBO_SIZE; // force orphan on first use
++	}
++	else rpglBindBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB, ps5_index_ibo );
++
++	ps5_index_offset = ( ps5_index_offset + 3 ) & ~(size_t)3;
++	if( ps5_index_offset + bytes > PS5_INDEX_IBO_SIZE )
++	{
++		pglBufferDataARB( GL_ELEMENT_ARRAY_BUFFER_ARB, PS5_INDEX_IBO_SIZE, NULL, GL_STREAM_DRAW_ARB );
++		ps5_index_offset = 0;
++	}
++	mem = pglMapBufferRange( GL_ELEMENT_ARRAY_BUFFER_ARB, ps5_index_offset, bytes,
++		GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_RANGE_BIT | GL_MAP_UNSYNCHRONIZED_BIT );
++	if( !mem )
++	{
++		rpglBindBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB, 0 );
++		return false;
++	}
++	memcpy( mem, indices, bytes );
++	pglUnmapBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB );
++	*indices_inout = (const GLvoid *)ps5_index_offset;
++	ps5_index_offset += bytes;
++	return true;
++}
++#define PS5_INDICES_BEGIN qboolean ps5_streamed = PS5_StreamIndices( count, type, &indices );
++#define PS5_INDICES_END if( ps5_streamed ) rpglBindBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB, 0 );
++#else
++#define PS5_INDICES_BEGIN
++#define PS5_INDICES_END
++#endif
++
+ static void APIENTRY GL2_DrawElements( GLenum mode, GLsizei count, GLenum type, const GLvoid *indices )
+ {
++	PS5_ARRAY_BEGIN
+ 	GL2_SetupArrays( 0, 0 );
+-	rpglDrawElements( mode, count, type, indices );
++	{
++		PS5_INDICES_BEGIN
++		rpglDrawElements( mode, count, type, indices );
++		PS5_INDICES_END
++	}
++	PS5_ARRAY_END
+ }
+ 
+ static void APIENTRY GL2_DrawRangeElements( GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const GLvoid *indices )
+ {
++	PS5_ARRAY_BEGIN
+ 	GL2_SetupArrays( start, end );
+-	if( rpglDrawRangeElements )
+-		rpglDrawRangeElements( mode, start, end, count, type, indices );
+-	else
+-		rpglDrawElements( mode, count, type, indices );
++	{
++		PS5_INDICES_BEGIN
++		if( rpglDrawRangeElements )
++			rpglDrawRangeElements( mode, start, end, count, type, indices );
++		else
++			rpglDrawElements( mode, count, type, indices );
++		PS5_INDICES_END
++	}
++	PS5_ARRAY_END
+ }
+ 
+ static void APIENTRY GL2_DrawArrays( GLenum mode, GLint first, GLsizei count )
+@@ -1721,8 +1849,10 @@ static void APIENTRY GL2_DrawArrays( GLenum mode, GLint first, GLsizei count )
+ 		return;
+ 
+ 	// vertices referenced are [first, first + count - 1], and first may be nonzero
++	PS5_ARRAY_BEGIN
+ 	GL2_SetupArrays( 0, first + count - 1 );
+ 	rpglDrawArrays( mode, first, count );
++	PS5_ARRAY_END
+ }
+ 
+ static void APIENTRY GL2_BindBufferARB( GLenum buf, GLuint obj )
+diff --git a/scripts/ps5-hide-internal-symbols.map b/scripts/ps5-hide-internal-symbols.map
+new file mode 100644
+index 0000000..97b73d1
+--- /dev/null
++++ b/scripts/ps5-hide-internal-symbols.map
+@@ -0,0 +1,23 @@
++/* PS5 homebrew packaging link helper.
++ *
++ * Mesa/libglapi (vendored via ps5-opengl's libPS5OpenGL.a) emits a handful
++ * of internal TLS-wrapper symbols (mangled as _ZTH*, e.g.
++ * _ZTH23_mesa_glapi_tls_Context) into the dynamic symbol table even on a
++ * final executable, not just a shared object. They have no legitimate
++ * external caller and -Wl,--exclude-libs=ALL does not catch them (they
++ * aren't plain exported library symbols, they're compiler-generated TLS
++ * init wrappers), so the PS5 native packaging tool
++ * (ps5-native-tool/sce_module_writer.cpp) refuses to link because no
++ * public SDK stub can "provide" them. Force them local explicitly.
++ */
++{
++	local:
++		_ZTH*;
++		__dlopen;
++		__dlsym;
++		__dladdr;
++		__dlclose;
++		__dlerror;
++		_Zn*;
++		_Zd*;
++};
+diff --git a/scripts/waifulib/xcompile.py b/scripts/waifulib/xcompile.py
+index 53736ee..0fca7a7 100644
+--- a/scripts/waifulib/xcompile.py
++++ b/scripts/waifulib/xcompile.py
+@@ -569,6 +569,186 @@ class PSVita:
+ 		ldflags = []
+ 		return ldflags
+ 
++class PS5:
++	# PS5 homebrew, built on the ps5-payload-dev/sdk clang/lld toolchain,
++	# linking against blackbearreloaded/ps5-opengl's static SDK for its
++	# EGL/GL headers and its SDL2 "G19" video driver integration.
++	#
++	# PS5_PAYLOAD_SDK  -> ps5-payload-sdk install root (has toolchain/prospero.mk)
++	# PS5_OPENGL_SDK   -> ps5-opengl's build/sdk/ps5-opengl-gl46 (relocatable package)
++	ctx              = None
++	payload_sdk_dir  = None
++	opengl_sdk_dir   = None
++
++	def __init__(self, ctx):
++		self.ctx = ctx
++
++		self.payload_sdk_dir = os.getenv('PS5_PAYLOAD_SDK')
++		if self.payload_sdk_dir is None:
++			ctx.fatal('Set PS5_PAYLOAD_SDK environment variable pointing to the installed ps5-payload-sdk directory!')
++
++		self.opengl_sdk_dir = os.getenv('PS5_OPENGL_SDK')
++		if self.opengl_sdk_dir is None:
++			ctx.fatal('Set PS5_OPENGL_SDK environment variable pointing to the built ps5-opengl-gl46 SDK directory!')
++
++	def gen_toolchain_prefix(self):
++		# ps5-payload-sdk wraps clang/lld rather than shipping a traditional
++		# target-prefixed binutils triplet; the wrapper scripts live in
++		# $PS5_PAYLOAD_SDK/bin.
++		return os.path.join(self.payload_sdk_dir, 'bin', 'prospero-')
++
++	def cc(self):
++		return self.gen_toolchain_prefix() + 'clang'
++
++	def cxx(self):
++		return self.gen_toolchain_prefix() + 'clang++'
++
++	def strip(self):
++		return self.gen_toolchain_prefix() + 'strip'
++
++	def ar(self):
++		return self.gen_toolchain_prefix() + 'ar'
++
++	def pkgconfig(self):
++		return 'pkg-config' # host pkg-config, pointed at PKG_CONFIG_PATH by the caller
++
++	def cflags(self, cxx = False):
++		cflags = []
++		cflags += ['-DXASH_PS5=1']
++		# NOTE: deliberately not adding -isystem .../target/include here:
++		# prospero-clang/prospero-clang++ already configure that path (and
++		# the matching c++/v1 headers, in the correct libc++-first order)
++		# via their own built-in -isysroot. Redeclaring it via an explicit
++		# -isystem flag inserts it ahead of the compiler's internal c++/v1
++		# search path and breaks libc++ header resolution for C++ sources
++		# (clang's "<cstdint> tried including <stdint.h> but didn't find
++		# libc++'s <stdint.h> header" class of errors).
++		cflags += ['-I', os.path.join(self.opengl_sdk_dir, 'include')]
++		return cflags
++
++	def linkflags(self):
++		linkflags = []
++		linkflags += ['-L', os.path.join(self.payload_sdk_dir, 'target', 'lib')]
++		linkflags += ['-L', os.path.join(self.opengl_sdk_dir, 'lib')]
++		# Mesa/libglapi internals (e.g. its TLS context wrapper symbol) leak
++		# into the dynamic symbol table otherwise, which the PS5 packaging
++		# tool then insists on resolving against a public SDK stub -- they
++		# have no legitimate external caller, so hide every archive's
++		# non-essential exports from the dynamic table at link time.
++		linkflags += ['-Wl,--exclude-libs=ALL']
++		# That symbol turns out to be an UNDEFINED weak reference (nm -D
++		# shows lowercase 'w'), not merely leaked-but-defined -- Mesa/
++		# libglapi's TLS model leaves it unresolved on this target, and the
++		# PS5 packaging tool treats every dynsym entry (even weak,
++		# never-called-when-unresolved ones) as a hard "must be provided by
++		# some stub" requirement. Force it to resolve to NULL at link time;
++		# weak-undefined is safe to bind to 0 by definition.
++		linkflags += ['-Wl,--defsym=_ZTH23_mesa_glapi_tls_Context=0']
++		return linkflags
++
++	def program_linkflags(self):
++		# These apply ONLY to the final executable (cprogram/cxxprogram),
++		# never to the engine's .so modules (filesystem_stdio, ref_gl,
++		# menu, game DLLs) -- a shared object has no .bss-bounds symbols
++		# in the same sense and the custom PIE layout below is pointless
++		# (and breaks) for them.
++		linkflags = []
++		# CRITICAL: the payload SDK's default crt1.o implements _start for
++		# payloads injected by elfldr (classic argc/argv/envp on the
++		# stack) -- NOT for a title launched natively by ShellCore/
++		# AppLaunchService. Confirmed via real hardware klog capture: the
++		# engine crashed with SIGSEGV at RIP=0x1 inside __crt_start,
++		# before main() -- it jumped through an unresolved dlsym'd
++		# function pointer while doing payload-style kernel_dynlib_dlsym
++		# bootstrapping that a natively-launched BigApp process doesn't
++		# support/need. ps5-native-app-boilerplate's own app_crt.cpp
++		# supplies the _start that correctly reads the real native launch
++		# process_parameters block and matches sce_module_writer.cpp's
++		# parameter-block layout; use its pre-compiled object instead of
++		# the SDK's crt1.o (-nostartfiles removes crt1.o from the
++		# prospero-clang++ wrapper's auto-added LIBS_CRT).
++		linkflags += ['-nostartfiles']
++		ps5_crt_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'build_ps5_crt')
++		app_crt_o = os.path.join(ps5_crt_dir, 'app_crt.o')
++		app_cpp_runtime_o = os.path.join(ps5_crt_dir, 'app_cpp_runtime.o')
++		if os.path.isfile(app_crt_o):
++			linkflags += [app_crt_o]
++		if os.path.isfile(app_cpp_runtime_o):
++			linkflags += [app_cpp_runtime_o]
++		# payload-sdk's -lc (static libc.a) includes mman.o, whose mmap/
++		# mprotect call an internal kernel_mprotect() that only crt1.o
++		# (which we just excluded) ever defines -- real BigApp launches
++		# never run that payload-style init, so it stays weak-undefined
++		# and the PS5 packaging tool refuses the link. The wrapper script
++		# always injects -lc ahead of our own link inputs, so lld locks
++		# in libc.a's buggy mmap/mprotect before even considering
++		# -lkernel_web's real dynamic ones. Group them together so lld
++		# treats both as a single resolution pass and dynamic libkernel_web
++		# (which the runtime always provides, exact same symbol names)
++		# wins instead.
++		# Native BigApp titles only get libkernel.sprx mapped (confirmed in the
++		# crash module list); libkernel_web imports are never bound and stay
++		# NULL (gettimeofday -> SIGSEGV rip=0 in SDL_GetPerformanceFrequency).
++		# The working boilerplate template imports from libkernel too.
++		linkflags += ['-Wl,--start-group', '-lkernel', '-lc', '-lSceLibcInternal', '-lSceNet', '-Wl,--end-group']
++		# dlopen/dlsym/dlclose/dladdr/dlerror (needed by Xash3D's game DLL
++		# loader) are all thin trampolines in libc.a's dlfcn.o that jump
++		# through weak-undefined function-pointer symbols __dlopen/etc,
++		# each NULL-checked first ("cmp $0, __dlopen; je <fallback>") --
++		# they're populated at runtime only by crt1.o's __rtld_init
++		# payload-style bootstrap, which real BigApp launches never run
++		# (same situation as kernel_mprotect above, but here the public
++		# dlopen() already degrades safely to returning NULL instead of
++		# crashing when its backing pointer is unset). Bind them to NULL
++		# so the link succeeds; game-DLL loading via dlopen will need a
++		# real replacement once this blocks forward progress, but it does
++		# not crash the engine on its own. Must come AFTER the -lc group
++		# above (lld only sees these symbols once dlfcn.o is pulled in)
++		# and BEFORE --version-script below (same ordering rule as every
++		# other defsym/local pair in this function).
++		linkflags += ['-Wl,--defsym=__dlopen=0', '-Wl,--defsym=__dlsym=0',
++			'-Wl,--defsym=__dladdr=0', '-Wl,--defsym=__dlclose=0',
++			'-Wl,--defsym=__dlerror=0']
++		# Force separate R-E (code) / R (rodata) / RW (data) PT_LOAD segments.
++		# Without this, lld merges .text into a combined RWE segment on this
++		# target -- a writable+executable segment the PS5 kernel's W^X
++		# enforcement rejects before main() ever runs (loader recovery
++		# failure, no crash log, title just never starts).
++		linkflags += ['-Wl,-z,separate-code']
++		# -z separate-code alone is insufficient: PS5's clang++ driver
++		# (prospero-clang++) still emits one merged RWE PT_LOAD by default.
++		# The native app boilerplate's own tooling solves this by driving
++		# lld directly with an explicit linker script (ps5-pie.ld) that
++		# puts .text/.rodata/.data in physically distinct PT_LOAD segments;
++		# reuse that exact script here instead of reinventing it.
++		pie_ld = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(self.payload_sdk_dir)))), 'ps5-native-app-boilerplate', 'tooling', 'native', 'ps5-pie.ld')
++		if os.path.isfile(pie_ld):
++			linkflags += ['-Wl,-T,' + pie_ld]
++		# ps5-pie.ld alone omits __eh_frame_start/__eh_frame_end, which
++		# libunwind.a needs to locate unwind tables at runtime -- without
++		# them the link fails ("undefined symbol: __eh_frame_start").
++		# blackbearreloaded/ProsperoEden (their Switch-emulator PS5 port)
++		# hit the exact same gap and ships a small second linker script
++		# (tools/unwind.ld) that PROVIDEs these from the already-linked
++		# .eh_frame/.eh_frame_hdr sections; stack it on top of ps5-pie.ld.
++		unwind_ld = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(self.payload_sdk_dir)))), 'prospero_eden', 'tools', 'unwind.ld')
++		if os.path.isfile(unwind_ld):
++			linkflags += ['-Wl,-T,' + unwind_ld]
++		# --version-script must come AFTER every -T linker script that
++		# defines the symbols it demotes to local (__bss_start etc. come
++		# from ps5-bss-symbols.ld above) -- lld rejects "local:" for a name
++		# that isn't defined yet at the point it processes the flag.
++		# --exclude-libs doesn't catch compiler-generated TLS-init wrapper
++		# symbols (_ZTH*) Mesa emits; hide those explicitly too (see
++		# scripts/ps5-hide-internal-symbols.map for why).
++		map_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'ps5-hide-internal-symbols.map')
++		linkflags += ['-Wl,--version-script=' + map_path]
++		return linkflags
++
++	def ldflags(self):
++		ldflags = []
++		return ldflags
++
+ class PSP:
+ 	ctx               = None # waf context
+ 	sdk_home          = None
+@@ -639,6 +819,8 @@ def options(opt):
+ 		help='enable building for Nintendo Switch [default: %(default)s]')
+ 	xc.add_option('--psvita', action='store_true', dest='PSVITA', default = False,
+ 		help='enable building for PlayStation Vita [default: %(default)s]')
++	xc.add_option('--ps5', action='store_true', dest='PS5', default = False,
++		help='enable building for PlayStation 5 homebrew (requires PS5_PAYLOAD_SDK, PS5_OPENGL_SDK) [default: %(default)s]')
+ 	xc.add_option('--sailfish', action='store_true', dest='SAILFISH', default = False,
+ 		help='enable building for Sailfish')
+ 	xc.add_option('--emscripten', action='store_true', dest='EMSCRIPTEN', default = None,
+@@ -744,6 +926,22 @@ def configure(conf):
+ 		conf.env.LIB_M = ['m']
+ 		conf.env.VRTLD = ['vrtld']
+ 		conf.env.DEST_OS = 'psvita'
++	elif conf.options.PS5:
++		conf.ps5 = ps5 = PS5(conf)
++		conf.environ['CC'] = ps5.cc()
++		conf.environ['CXX'] = ps5.cxx()
++		conf.environ['STRIP'] = ps5.strip()
++		conf.environ['AR'] = ps5.ar()
++		conf.env.PKGCONFIG = ps5.pkgconfig()
++		conf.env.CFLAGS += ps5.cflags()
++		conf.env.CXXFLAGS += ps5.cflags(True)
++		conf.env.LINKFLAGS += ps5.linkflags()
++		conf.env.LINKFLAGS_cprogram += ps5.program_linkflags()
++		conf.env.LINKFLAGS_cxxprogram += ps5.program_linkflags()
++		conf.env.LDFLAGS += ps5.ldflags()
++		conf.env.HAVE_M = True
++		conf.env.LIB_M = [] # math lives in libc.a; no separate libm to link
++		conf.env.DEST_OS = 'ps5'
+ 	elif conf.options.PSP_OPTS:
+ 		values = conf.options.PSP_OPTS.split(',')
+ 		if len(values) != 3:
+diff --git a/scripts/waifulib/xshlib.py b/scripts/waifulib/xshlib.py
+index 72e673a..0b2414e 100644
+--- a/scripts/waifulib/xshlib.py
++++ b/scripts/waifulib/xshlib.py
+@@ -40,7 +40,7 @@ class objcopy_relocatable_lib(Task.Task):
+ class xshlib(ccroot.link_task):
+ 	"make relocatable library"
+ 	no_errcheck_out = True
+-	run_str = '${LD} -r -o ${TGT[0].abspath()} ${LD_RELOCATABLE_FLAGS} ${CCLNK_SRC_F}${SRC}'
++	run_str = '${LD} -r -o ${TGT[0].abspath()} ${LD_RELOCATABLE_FLAGS} ${CCLNK_SRC_F}${SRC} ${STLIBPATH_ST:STLIBPATH} ${STLIB_ST:STLIB}'
+ 
+ 	def add_target(self, target):
+ 		"create objcopy task for target"
+@@ -68,13 +68,20 @@ class cxxprogram_static(cxx.cxxprogram):
+ # usevars are same
+ ccroot.USELIB_VARS['cprogram_static'] = ccroot.USELIB_VARS['cxxprogram_static'] = ccroot.USELIB_VARS['cxxprogram']
+ 
++def extra_static_objs():
++	import os
++	return [e for e in os.environ.get('XASH_EXTRA_STATIC_OBJS', '').split(',') if e]
++
+ def apply_static(main, *reloc):
+ 	"apply xshlib tasks and generate files"
+ 
+ 	def write_libraries_list(out_node):
+ 		"generate library list"
+ 
+-		libraries = reloc
++		# Extra prebuilt relocatable libs (e.g. HLSDK server/client on PS5,
++		# where native titles have no working dlopen): XASH_EXTRA_STATIC_OBJS
++		# = "server=/abs/server.o,client=/abs/client.o"
++		libraries = list(reloc) + [e.split('=')[0] for e in extra_static_objs()]
+ 		externs = '\n'.join(['extern table_t lib_%s_exports[];' % e for e in libraries])
+ 		table = '\n'.join(['{ "%s", &lib_%s_exports },' % (e, e) for e in libraries])
+ 		out_node.write('%s\nstruct {const char *name;void *func;} libs[] = {\n%s\n{0,0}\n};\n' % (externs, table ))
+@@ -113,3 +120,5 @@ def apply_static(main, *reloc):
+ 
+ 			for t in reloc:
+ 				self.source += [self.bld.get_tgen_by_name(t).objcopy_task.outputs[0]]
++			for e in extra_static_objs():
++				self.source += [self.bld.root.find_node(e.split('=', 1)[1])]
+diff --git a/wscript b/wscript
+index 3158145..9461a05 100644
+--- a/wscript
++++ b/wscript
+@@ -242,6 +242,14 @@ def configure(conf):
+ 	# Load compilers early
+ 	conf.load('xshlib xcompile compiler_c compiler_cxx')
+ 
++	# WORKAROUND: prospero-clang (PS5 toolchain) defines __FreeBSD__ since
++	# the PS5 kernel is FreeBSD-derived; waf's get_cc_version() probes the
++	# compiler's predefined macros and unconditionally overwrites DEST_OS
++	# based on MACRO_TO_DESTOS, clobbering the 'ps5' we set in xcompile.py's
++	# PS5 branch with 'freebsd'. Force it back.
++	if conf.options.PS5:
++		conf.env.DEST_OS = 'ps5'
++
+ 	if not conf.options.WAFCACHE:
+ 		conf.load('gccdeps')
+ 
+@@ -443,7 +451,7 @@ def configure(conf):
+ 	if not conf.options.DEDICATED:
+ 		conf.env.SERVER = conf.options.ENABLE_DEDICATED
+ 		conf.env.CLIENT = True
+-		conf.env.LAUNCHER = conf.env.DEST_OS not in ['android', 'nswitch', 'psvita', 'dos', 'emscripten'] and not conf.env.IOS and not conf.env.MAGX and not conf.env.STATIC_LINKING
++		conf.env.LAUNCHER = conf.env.DEST_OS not in ['android', 'nswitch', 'psvita', 'ps5', 'dos', 'emscripten'] and not conf.env.IOS and not conf.env.MAGX and not conf.env.STATIC_LINKING
+ 	else:
+ 		conf.env.SERVER = True
+ 		conf.env.CLIENT = False
+@@ -453,7 +461,7 @@ def configure(conf):
+ 
+ 	conf.define_cond('SUPPORT_HL25_EXTENDED_STRUCTS', conf.options.SUPPORT_HL25_EXTENDED_STRUCTS)
+ 
+-	if conf.options.ENABLE_RPATH and conf.env.DEST_OS not in ['nswitch', 'psvita']:
++	if conf.options.ENABLE_RPATH and conf.env.DEST_OS not in ['nswitch', 'psvita', 'ps5']:
+ 		if conf.env.DEST_OS == 'openbsd':
+ 			# OpenBSD requires -z origin to enable $ORIGIN expansion in RPATH
+ 			conf.env.RPATH_ST = '-Wl,-z,origin,-rpath,%s'
+@@ -481,6 +489,11 @@ def configure(conf):
+ 	elif conf.env.DEST_OS == 'psvita':
+ 		conf.check_cc(lib='vrtld')
+ 		conf.check_cc(lib='m')
++	elif conf.env.DEST_OS == 'ps5':
++		# real libc via ps5-payload-sdk; no dlopen support confirmed yet,
++		# so skip the generic 'dl' check in the catch-all else branch below.
++		# math functions live in libc.a itself, there is no separate libm.
++		pass
+ 	elif conf.env.DEST_OS == 'android':
+ 		# maybe there is some better check?
+ 		if conf.find_program('termux-info', mandatory=False):
