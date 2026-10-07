@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Deploy a XashPS5 title folder to a PS5 over FTP (etaHEN / ftpsrv).
 
-  python3 scripts/deploy.py dist/PPSA99999 192.168.1.14 [--port 2121] [--only-engine]
+  python3 scripts/deploy.py dist/PPSA19111 192.168.1.14 [--port 2121] [--only-engine]
 
 Uploads every file to /data/homebrew/<TITLE_ID>/ with an atomic
 STOR-to-temp + RENAME, eboot.bin and param.json last. --only-engine uploads

@@ -6,7 +6,7 @@ rendered with real hardware OpenGL via
 [ps5-opengl](https://github.com/blackbearreloaded/ps5-opengl) and packaged with
 [ps5-native-app-boilerplate](https://github.com/blackbearreloaded/ps5-native-app-boilerplate).
 
-**Version 1.1** — title `PPSA99999`, shown as *XashPS5 V1.1* on the home screen.
+**Version 1.2** — title `PPSA19111`, shown as *XashPS5 V1.2* on the home screen.
 
 > **No game data is included.** You need your own copy of Half-Life
 > (the `valve` folder from Steam). Valve's files are not, and will never be,
@@ -25,7 +25,8 @@ rendered with real hardware OpenGL via
   Circle / Options = close
 - **Sound** through `sceAudioOut` (mixer at 44.1 kHz, resampled to 48 kHz)
 - **DualSense**: full controller layout, **vibrations** (damage, screen shake, weapon recoil)
-- On-screen keyboard (Xash built-in) for the console, player name, server name…
+- **PS5 system keyboard** for the console, player name, server name… (Xash's
+  built-in on-screen keyboard is the fallback)
 - **Debug menu** in the main menu: load any map, god mode, all weapons,
   full health, noclip, notarget, vibration test
 - Custom home-screen icon and background
@@ -50,20 +51,20 @@ cd xash3d-ps5
 [`patches/UPSTREAM_COMMITS.txt`](patches/UPSTREAM_COMMITS.txt), applies the
 XashPS5 patches, builds the payload SDK + libc runtime, the OpenGL SDK and its
 SDL2 bridge, hlsdk-portable and the engine, then signs and packages the title
-into `dist/PPSA99999/`. The first run takes a while (Mesa is compiled).
+into `dist/PPSA19111/`. The first run takes a while (Mesa is compiled).
 
 ## Install
 
-1. Copy your Half-Life `valve` folder into `dist/PPSA99999/valve/` (and, if you
+1. Copy your Half-Life `valve` folder into `dist/PPSA19111/valve/` (and, if you
    own them, `gearbox/` and `bshift/` next to it)
    (keep the `userconfig.cfg` and `autoexec.cfg` from this repo — they hold the
    PS5 controls and performance settings; if you already have an
    `autoexec.cfg`, just append its lines).
 2. Send it to the console:
    ```sh
-   python3 scripts/deploy.py dist/PPSA99999 <ps5-ip>
+   python3 scripts/deploy.py dist/PPSA19111 <ps5-ip>
    # later, engine-only redeploys:
-   python3 scripts/deploy.py dist/PPSA99999 <ps5-ip> --only-engine
+   python3 scripts/deploy.py dist/PPSA19111 <ps5-ip> --only-engine
    ```
 3. Launch **XashPS5 V1.1** from the home screen.
 
@@ -98,14 +99,13 @@ which starts with `unbindall`).
 | SDL2 built without audio | `sceAudioOut` backend (`engine/platform/ps5/s_ps5.c`) |
 | ~1 FPS: every immediate-mode draw was a synchronous GPU submit | fans/quads converted to indexed `GL_TRIANGLES`, client indices streamed to a buffer, world drawn through VBOs (`gl_vbo 1`) → driver batches draws, 60 FPS |
 | Combat drops: one GPU submit per model triangle strip | strips/fans of a model mesh expanded into one indexed triangle list (one draw per mesh); decals, sprites and particles converted too |
+| System keyboard: `sceImeDialog*` never resolved through `sceKernelDlsym` | `sceCommonDialogInitialize` + `sceSysmoduleLoadModule(ImeDialog)` with regular imports, plus a link-only `libSceCommonDialog` stub (the public SDK lacks one), as in BlackBearReloaded's ProsperoTV |
 | `exit()` raises SIGSYS in a native title | *Quit* closes the app through `sceSystemServiceLoadExec("exit")` |
 | Several games in one title | Half-Life, Opposing Force and Blue Shift game code linked side by side; *Change game* relaunches the title with `-game <dir>` |
 | Logs | every console line mirrored to the kernel log (`sceKernelDebugOutText`) |
 
 ## Known limitations
 
-- The PS5 system keyboard (`sceImeDialog`) cannot be resolved from a native title
-  yet; Xash's built-in on-screen keyboard is used instead.
 - Internet server browser untested; LAN works.
 - Counter-Strike: the `cstrike` folder launches, but its own game code is not
   included yet.

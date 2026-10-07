@@ -7,10 +7,10 @@
   "attribute": 0,
   "attribute2": 0,
   "attribute3": 0,
-  "conceptId": "99999",
+  "conceptId": "19111",
   "contentBadgeType": 1,
-  "contentId": "UP9000-PPSA99999_00-HELLOWORLD000001",
-  "contentVersion": "01.000.000",
+  "contentId": "UP9000-PPSA19111_00-XASHPS5HLPORT001",
+  "contentVersion": "01.020.000",
   "downloadDataSize": 256,
   "gameIntent": {
     "permittedIntents": [
@@ -22,7 +22,7 @@
   "localizedParameters": {
     "defaultLanguage": "en-US",
     "en-US": {
-      "titleName": "XashPS5 V0.27"
+      "titleName": "XashPS5 V1.2"
     }
   },
   "masterVersion": "01.00",
@@ -33,6 +33,6 @@
   },
   "requiredSystemSoftwareVersion": "0x0000000000000000",
   "sdkVersion": "0x0000000000000000",
-  "titleId": "PPSA99999",
+  "titleId": "PPSA19111",
   "versionFileUri": ""
 }

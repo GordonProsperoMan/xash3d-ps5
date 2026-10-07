@@ -1,5 +1,14 @@
 # Changelog
 
+## V1.2
+
+### New
+- PS5 system keyboard: text fields (console, player name, server name, chat) open the system keyboard; Xash's built-in keyboard remains as a fallback
+- New permanent title ID **PPSA19111** (the boilerplate's `PPSA99999` is reserved), so XashPS5 can be listed on homebrew.page
+
+### Upgrading from 1.0 / 1.1
+- PPSA19111 is a separate title: copy your game folders (and `valve/SAVE` for your saves) from `PPSA99999`, then delete the old title
+
 ## V1.1
 
 ### New

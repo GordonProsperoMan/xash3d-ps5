@@ -10,7 +10,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="${WORK:-$ROOT/work}"
-DIST="${DIST:-$ROOT/dist/PPSA99999}"
+DIST="${DIST:-$ROOT/dist/PPSA19111}"
 VERSION="$(cat "$ROOT/VERSION")"
 mkdir -p "$WORK"
 
@@ -79,6 +79,11 @@ for g in opfor:gearbox bshift:bshift; do
 	python3 "$ROOT/scripts/build_static_gamelibs.py" "$WORK/hlsdk_$src" "$SG" "$dir"
 done
 
+echo "==> Link-only CommonDialog stub (system keyboard; absent from the public SDK stubs)"
+"$SDK/bin/prospero-clang" -O2 -fPIC -c "$WORK/xash3d-fwgs/scripts/ps5_stubs/common_dialog_link_stub.c" -o "$WORK/common_dialog_link_stub.o"
+"$SDK/bin/prospero-lld" --shared -soname libSceCommonDialog.sprx \
+	-o "$WORK/xash3d-fwgs/scripts/ps5_stubs/libSceCommonDialog.so" "$WORK/common_dialog_link_stub.o"
+
 echo "==> Xash3D FWGS engine (single static binary)"
 export XASH_EXTRA_STATIC_OBJS="server=$SG/server.o,client=$SG/client.o,server@gearbox=$SG/server_gearbox.o,client@gearbox=$SG/client_gearbox.o,server@bshift=$SG/server_bshift.o,client@bshift=$SG/client_bshift.o"
 ( cd "$WORK/xash3d-fwgs" &&
@@ -88,7 +93,8 @@ export XASH_EXTRA_STATIC_OBJS="server=$SG/server.o,client=$SG/client.o,server@ge
 echo "==> Packaging $DIST"
 mkdir -p "$WORK/pkg" "$DIST/sce_sys" "$DIST/sce_module" "$DIST/valve"
 "$TOOL" link --in "$WORK/xash3d-fwgs/build/engine/xash" --out "$WORK/pkg/eboot.elf" \
-	--stub "$GL_SDK/lib/libSceAgc.so" --stub "$GL_SDK/lib/libSceAgcDriver.so" --stub-dir "$SDK/target/lib"
+	--stub "$GL_SDK/lib/libSceAgc.so" --stub "$GL_SDK/lib/libSceAgcDriver.so" \
+	--stub "$WORK/xash3d-fwgs/scripts/ps5_stubs/libSceCommonDialog.so" --stub-dir "$SDK/target/lib"
 "$TOOL" self --sign --in "$WORK/pkg/eboot.elf" --out "$DIST/eboot.bin" --magic 0x1D3D154F
 "$TOOL" self --inspect --file "$DIST/eboot.bin" | grep -q "integrity: valid"
 cp "$WORK/ps5_boilerplate/runtime/libc.prx" "$DIST/sce_module/"
@@ -98,7 +104,6 @@ import json, sys
 p, v = sys.argv[1], sys.argv[2]
 d = json.load(open(p))
 d['localizedParameters']['en-US']['titleName'] = 'XashPS5 ' + v
-d['contentVersion'] = '01.000.000'
 json.dump(d, open(p, 'w'), indent=2)
 EOF
 cp "$ROOT/configs/valve/"*.cfg "$DIST/valve/"

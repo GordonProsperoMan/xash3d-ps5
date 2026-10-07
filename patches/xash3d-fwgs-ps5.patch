@@ -839,10 +839,10 @@ index 0000000..68e51d1
 +}
 diff --git a/engine/platform/ps5/in_ps5.c b/engine/platform/ps5/in_ps5.c
 new file mode 100644
-index 0000000..5814b00
+index 0000000..e6b8bef
 --- /dev/null
 +++ b/engine/platform/ps5/in_ps5.c
-@@ -0,0 +1,267 @@
+@@ -0,0 +1,256 @@
 +/*
 +in_ps5.c - PS5 system on-screen keyboard (sceImeDialog) for text input
 +Copyright (C) 2026 XashPS5 port
@@ -901,81 +901,56 @@ index 0000000..5814b00
 +
 +enum { IME_STATUS_NONE, IME_STATUS_RUNNING, IME_STATUS_FINISHED };
 +
-+// libSceImeDialog is NOT mapped by the loader for native titles even when it is
-+// listed in DT_NEEDED (the crash log module list lacks it, and the first call
-+// jumped to rip=1). Load it explicitly and resolve the entry points by hand;
-+// if anything fails, text input simply stays disabled instead of crashing.
-+int sceKernelLoadStartModule( const char *path, size_t argc, const void *argv, uint32_t flags, void *opt, int *res );
-+int sceKernelDlsym( int handle, const char *symbol, void **addr );
-+int sceSysmoduleLoadModule( uint16_t id );
++// Same sequence as BlackBearReloaded's ProsperoTV (a native PS5 title with a
++// working system keyboard): initialise CommonDialog, load the ImeDialog system
++// module through SceSysmodule, then call the regular sceImeDialog* imports
++// (bound from the public SDK stub libSceImeDialog.so). The earlier attempt
++// loaded the .sprx by path and looked the symbols up with sceKernelDlsym,
++// which never resolved them.
++#define SCE_SYSMODULE_IME_DIALOG 0x0096
++#define SCE_COMMON_DIALOG_ALREADY_INITIALIZED 0x80B80002u
 +
-+static int ( *p_sceImeDialogInit )( const ps5_ime_param_t *param, void *extended );
-+static int ( *p_sceImeDialogGetStatus )( void );
-+static int ( *p_sceImeDialogGetResult )( ps5_ime_result_t *result );
-+static int ( *p_sceImeDialogTerm )( void );
-+#define sceImeDialogInit      p_sceImeDialogInit
-+#define sceImeDialogGetStatus p_sceImeDialogGetStatus
-+#define sceImeDialogGetResult p_sceImeDialogGetResult
-+#define sceImeDialogTerm      p_sceImeDialogTerm
++int sceCommonDialogInitialize( void );
++int sceSysmoduleLoadModule( uint16_t id );
++int sceImeDialogInit( const ps5_ime_param_t *param, const void *extended );
++int sceImeDialogGetStatus( void );
++int sceImeDialogGetResult( ps5_ime_result_t *result );
++int sceImeDialogTerm( void );
++int sceImeDialogAbort( void );
++
++_Static_assert( sizeof( ps5_ime_param_t ) == 96, "unexpected PS5 IME parameter layout" );
++_Static_assert( sizeof( ps5_ime_result_t ) == 16, "unexpected PS5 IME result layout" );
 +
 +static int ime_lib_state; // 0 untried, 1 ok, -1 unavailable
 +
 +static qboolean IME_LoadLibrary( void )
 +{
-+	static const char *paths[] =
-+	{
-+		"/system/common/lib/libSceImeDialog.sprx",
-+		"/system_ex/common_ex/lib/libSceImeDialog.sprx",
-+		"libSceImeDialog.sprx",
-+	};
-+	int handle = -1, ret;
++	int ret;
 +
 +	if( ime_lib_state )
 +		return ime_lib_state > 0;
 +	ime_lib_state = -1;
 +
-+	// common dialog first (IME dialog depends on it); 0x0095/0x0096 are the
-+	// SceSysmodule ids for CommonDialog / ImeDialog
-+	ret = sceSysmoduleLoadModule( 0x0095 );
-+	Con_Reportf( "IME: sysmodule CommonDialog -> 0x%x\n", ret );
-+	ret = sceSysmoduleLoadModule( 0x0096 );
-+	Con_Reportf( "IME: sysmodule ImeDialog -> 0x%x\n", ret );
-+
-+	for( size_t i = 0; i < sizeof( paths ) / sizeof( paths[0] ) && handle < 0; i++ )
++	ret = sceCommonDialogInitialize();
++	Con_Reportf( "IME: sceCommonDialogInitialize -> 0x%x\n", ret );
++	if( ret < 0 && (uint32_t)ret != SCE_COMMON_DIALOG_ALREADY_INITIALIZED )
 +	{
-+		handle = sceKernelLoadStartModule( paths[i], 0, NULL, 0, NULL, NULL );
-+		Con_Reportf( "IME: load %s -> 0x%x\n", paths[i], handle );
-+	}
-+	if( handle < 0 )
-+	{
-+		Con_Printf( S_WARN "IME: libSceImeDialog unavailable, falling back to the built-in on-screen keyboard\n" );
++		Con_Printf( S_WARN "IME: CommonDialog unavailable, using the built-in on-screen keyboard\n" );
 +		Cvar_SetValue( "osk_enable", 1 );
 +		return false;
 +	}
 +
++	ret = sceSysmoduleLoadModule( SCE_SYSMODULE_IME_DIALOG );
++	Con_Reportf( "IME: sceSysmoduleLoadModule(ImeDialog) -> 0x%x\n", ret );
++	if( ret < 0 )
 +	{
-+		static const char *names[4] = { "sceImeDialogInit", "sceImeDialogGetStatus", "sceImeDialogGetResult", "sceImeDialogTerm" };
-+		void **slots[4] = { (void **)&p_sceImeDialogInit, (void **)&p_sceImeDialogGetStatus,
-+			(void **)&p_sceImeDialogGetResult, (void **)&p_sceImeDialogTerm };
-+		qboolean ok = true;
-+
-+		for( int i = 0; i < 4; i++ )
-+		{
-+			*slots[i] = NULL;
-+			ret = sceKernelDlsym( handle, names[i], slots[i] );
-+			Con_Reportf( "IME: dlsym %s -> 0x%x %p\n", names[i], ret, *slots[i] );
-+			if( ret != 0 || !*slots[i] )
-+				ok = false;
-+		}
-+		if( !ok )
-+		{
-+			Con_Printf( S_WARN "IME: symbol lookup failed, falling back to the built-in on-screen keyboard\n" );
-+			Cvar_SetValue( "osk_enable", 1 );
-+			return false;
-+		}
++		Con_Printf( S_WARN "IME: ImeDialog module unavailable, using the built-in on-screen keyboard\n" );
++		Cvar_SetValue( "osk_enable", 1 );
++		return false;
 +	}
 +
 +	ime_lib_state = 1;
++	Cvar_SetValue( "osk_enable", 0 );
 +	Con_Printf( "IME: system keyboard ready\n" );
 +	return true;
 +}
@@ -988,6 +963,7 @@ index 0000000..5814b00
 +static qboolean    ime_running;
 +static qboolean    ime_wanted;    // engine text input is active
 +static double      ime_reopen_time;
++static double      ime_open_time;
 +static ime_wchar_t ime_text[IME_MAX_TEXT + 1];
 +static const ime_wchar_t ime_title[] = { 'X','a','s','h','3','D', 0 };
 +
@@ -1017,10 +993,8 @@ index 0000000..5814b00
 +	param.maxTextLength   = IME_MAX_TEXT;
 +	param.inputTextBuffer = ime_text;
 +	param.title           = ime_title;
-+	param.halign          = 1; // center
-+	param.valign          = 2; // bottom
-+	param.posx            = 1920.0f;
-+	param.posy            = 2100.0f;
++	param.halign          = 1; // same placement as ProsperoTV (system default panel)
++	param.valign          = 1;
 +
 +	ret = sceImeDialogInit( &param, NULL );
 +	if( ret < 0 )
@@ -1028,6 +1002,8 @@ index 0000000..5814b00
 +		Con_Reportf( S_WARN "IME: sceImeDialogInit failed 0x%x\n", ret );
 +		return;
 +	}
++	Con_Reportf( "IME: dialog opened\n" );
++	ime_open_time = Platform_DoubleTime();
 +	ime_running = true;
 +}
 +
@@ -1046,8 +1022,10 @@ index 0000000..5814b00
 +	ime_wanted = enable;
 +	if( enable )
 +	{
-+		ime_reopen_time = 0.0;
-+		IME_Open();
++		// open a moment later, like ProsperoTV waits for Cross to be released:
++		// the button that opened the field must not reach the dialog
++		if( !ime_running )
++			ime_reopen_time = Platform_DoubleTime() + 0.3;
 +	}
 +	else IME_Close();
 +}
@@ -1083,13 +1061,24 @@ index 0000000..5814b00
 +	}
 +
 +	status = sceImeDialogGetStatus();
-+	if( status != IME_STATUS_FINISHED )
++	if( status == IME_STATUS_RUNNING )
 +		return;
++	// the dialog reports NONE for a moment right after Init
++	if( status == IME_STATUS_NONE && Platform_DoubleTime() - ime_open_time < 1.0 )
++		return;
++	if( status != IME_STATUS_FINISHED )
++	{
++		Con_Reportf( S_WARN "IME: dialog closed without result (status %d)\n", status );
++		IME_Close();
++		ime_wanted = false;
++		return;
++	}
 +
 +	{
 +		ps5_ime_result_t result;
 +		memset( &result, 0, sizeof( result ));
 +		sceImeDialogGetResult( &result );
++		Con_Reportf( "IME: finished, outcome %d\n", result.outcome );
 +		IME_Close();
 +
 +		if( result.outcome == 0 )
@@ -1835,7 +1824,7 @@ index e85afd2..66a9cd8 100644
  
  int GL_SetAttribute( int attr, int val )
 diff --git a/engine/wscript b/engine/wscript
-index 791b9d2..9dfc372 100644
+index 791b9d2..7ae9373 100644
 --- a/engine/wscript
 +++ b/engine/wscript
 @@ -115,6 +115,32 @@ def configure(conf):
@@ -1881,7 +1870,7 @@ index 791b9d2..9dfc372 100644
  			defines += ['XASH_SDL=%d' % bld.env.XASH_SDL]
  
  		if bld.get_define('HAVE_FFMPEG'):
-@@ -295,9 +322,28 @@ def build(bld):
+@@ -295,9 +322,31 @@ def build(bld):
  
  		if bld.env.DEST_OS in ['nswitch', 'psvita', 'emscripten']:
  			install_path = None
@@ -1905,7 +1894,10 @@ index 791b9d2..9dfc372 100644
 +				linkflags += ['-Wl,--wrap=' + sym]
 +
 +		if bld.env.DEST_OS == 'ps5':
-+			linkflags += ['-lSceAudioOut', '-lSceUserService', '-lSceSysmodule'] # platform/ps5/s_ps5.c, in_ps5.c
++			stub_dir = bld.path.parent.find_node('scripts/ps5_stubs').abspath()
++			# in_ps5.c: system keyboard = ImeDialog + CommonDialog (link-only stub, see scripts/ps5_stubs)
++			linkflags += ['-lSceAudioOut', '-lSceUserService', '-lSceSysmodule', '-lSceImeDialog',
++				stub_dir + '/libSceCommonDialog.so'] # platform/ps5/s_ps5.c, in_ps5.c
 +
  		if bld.env.DEST_OS == 'emscripten':
  			linkflags = ['-sINITIAL_MEMORY=134217728', '-sALLOW_MEMORY_GROWTH=1', '-sSTACK_SIZE=16777216']
@@ -2528,6 +2520,19 @@ index 0000000..97b73d1
 +		_Zn*;
 +		_Zd*;
 +};
+diff --git a/scripts/ps5_stubs/common_dialog_link_stub.c b/scripts/ps5_stubs/common_dialog_link_stub.c
+new file mode 100644
+index 0000000..74447b2
+--- /dev/null
++++ b/scripts/ps5_stubs/common_dialog_link_stub.c
+@@ -0,0 +1,7 @@
++/*
++ * Link-only facade for libSceCommonDialog (absent from the public SDK stubs).
++ * It only gives the linker and ps5-native-tool the import; at run time the
++ * system module provides the real function. Same approach as ProsperoTV.
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++void sceCommonDialogInitialize( void ) { }
 diff --git a/scripts/waifulib/xcompile.py b/scripts/waifulib/xcompile.py
 index 53736ee..0fca7a7 100644
 --- a/scripts/waifulib/xcompile.py
