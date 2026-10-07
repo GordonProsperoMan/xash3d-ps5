@@ -1,0 +1,90 @@
+diff --git a/integration/SDL2/SDL_ps5g19.c b/integration/SDL2/SDL_ps5g19.c
+index ad6d482..9fa3311 100644
+--- a/integration/SDL2/SDL_ps5g19.c
++++ b/integration/SDL2/SDL_ps5g19.c
+@@ -6,6 +6,8 @@
+ #include "SDL_internal.h"
+ #include "video/SDL_sysvideo.h"
+ #include "events/SDL_keyboard_c.h"
++#include "SDL_hints.h"
++#include "SDL_log.h"
+ #include <EGL/egl.h>
+ #include <EGL/eglext.h>
+ #include "ps5g19_display.h"
+@@ -13,6 +15,7 @@
+ /* ponytail: one fixed-profile window/context on the video thread; extend only with a
+  * separately validated EGL ownership contract. No private presentation API. */
+ typedef struct {
++    int width, height;          /* selected scanout size (runtime display modes) */
+     EGLDisplay display;
+     EGLConfig config;
+     EGLSurface surface;
+@@ -33,6 +36,30 @@ static int on_thread(G19 *g)
+         SDL_SetError("G19 requires the video thread");
+ }
+ 
++/* Runtime display modes (SDKs built with PS5_DYNAMIC_SCANOUT=1). Weak so the
++ * driver still links against fixed-profile SDKs, which keep the native size. */
++EGLBoolean eglSetDisplayModePS5(EGLDisplay, EGLint, EGLint) __attribute__((weak));
++
++static void choose_mode(G19 *g)
++{
++    /* SDL hint / environment "SDL_PS5_RESOLUTION": 1080, 1440 or 2160 */
++    const char *want = SDL_GetHint("SDL_PS5_RESOLUTION");
++    int h = want ? SDL_atoi(want) : 0;
++    g->width = PS5_OPENGL_NATIVE_WIDTH;
++    g->height = PS5_OPENGL_NATIVE_HEIGHT;
++    if (!eglSetDisplayModePS5 || (h != 1080 && h != 1440 && h != 2160))
++        return;
++    {
++        int w = h == 2160 ? 3840 : h == 1440 ? 2560 : 1920;
++        if (eglSetDisplayModePS5(g->display, w, h)) {
++            g->width = w;
++            g->height = h;
++        } else {
++            SDL_Log("G19: eglSetDisplayModePS5(%d, %d) refused (0x%04x)", w, h, eglGetError());
++        }
++    }
++}
++
+ static int video_init(_THIS)
+ {
+     G19 *g = _this->driverdata;
+@@ -42,6 +69,9 @@ static int video_init(_THIS)
+     g->thread = SDL_ThreadID();
+     g->display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+     if (g->display == EGL_NO_DISPLAY) return egl_error("eglGetDisplay");
++    choose_mode(g);
++    mode.w = g->width;
++    mode.h = g->height;
+     if (!eglInitialize(g->display, NULL, NULL)) {
+         g->display = EGL_NO_DISPLAY;
+         return egl_error("eglInitialize");
+@@ -84,11 +114,11 @@ static int create_window(_THIS, SDL_Window *window)
+         EGL_STENCIL_SIZE, _this->gl_config.stencil_size, EGL_NONE
+     };
+     if (on_thread(g) < 0) return -1;
+-    if (g->window || g->surface || window->w != PS5_OPENGL_NATIVE_WIDTH ||
+-        window->h != PS5_OPENGL_NATIVE_HEIGHT ||
++    if (g->window || g->surface || window->w != g->width ||
++        window->h != g->height ||
+         !(window->flags & SDL_WINDOW_OPENGL) || (window->flags & SDL_WINDOW_RESIZABLE))
+         return SDL_SetError("G19 requires one fixed %dx%d OpenGL window",
+-                            PS5_OPENGL_NATIVE_WIDTH, PS5_OPENGL_NATIVE_HEIGHT);
++                            g->width, g->height);
+     if (_this->gl_config.stereo || _this->gl_config.multisamplebuffers ||
+         _this->gl_config.multisamplesamples || _this->gl_config.floatbuffers ||
+         _this->gl_config.framebuffer_srgb_capable || _this->gl_config.accum_red_size ||
+@@ -214,9 +244,9 @@ static void destroy_window(_THIS, SDL_Window *window)
+ 
+ static void set_window_size(_THIS, SDL_Window *window)
+ {
+-    (void)_this;
+-    window->w = window->windowed.w = PS5_OPENGL_NATIVE_WIDTH;
+-    window->h = window->windowed.h = PS5_OPENGL_NATIVE_HEIGHT;
++    G19 *g = _this->driverdata;
++    window->w = window->windowed.w = g->width;
++    window->h = window->windowed.h = g->height;
+     SDL_SetError("G19 SDL does not support resizing");
+ }
+ 

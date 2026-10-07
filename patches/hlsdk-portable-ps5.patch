@@ -1,3 +1,27 @@
+diff --git a/cl_dll/vgui_TeamFortressViewport.cpp b/cl_dll/vgui_TeamFortressViewport.cpp
+index e106f36..2338b9f 100644
+--- a/cl_dll/vgui_TeamFortressViewport.cpp
++++ b/cl_dll/vgui_TeamFortressViewport.cpp
+@@ -1785,6 +1785,19 @@ bool TeamFortressViewport::SlotInput( int iSlot )
+ // Direct Key Input
+ int TeamFortressViewport::KeyInput( int down, int keynum, const char *pszCurrentBinding )
+ {
++#if defined(__FreeBSD__) || defined(XASH_PS5)
++	// Gamepad: there is no mouse to click the VGUI windows (MOTD, map
++	// briefing...). While a VGUI menu is open, Cross acts as Enter and
++	// Circle / Options as Escape. (K_AUX1 = A/Cross, K_AUX2 = B/Circle,
++	// K_AUX9 = Start/Options in the Xash3D gamepad key map.)
++	if( m_pCurrentMenu && gEngfuncs.Con_IsVisible() == false )
++	{
++		if( keynum == K_AUX1 )
++			keynum = K_ENTER;
++		else if( keynum == K_AUX2 || keynum == K_AUX9 )
++			keynum = K_ESCAPE;
++	}
++#endif
+ 	// Enter gets out of Spectator Mode by bringing up the Team Menu
+ 	if( m_iUser1 && gEngfuncs.Con_IsVisible() == false )
+ 	{
 diff --git a/cl_dll/view.cpp b/cl_dll/view.cpp
 index 3b3187d..40d9d8b 100644
 --- a/cl_dll/view.cpp

@@ -33,12 +33,17 @@ if [ -z "${SKIP_FETCH:-}" ]; then
 	checkout xash3d-fwgs  https://github.com/FWGS/xash3d-fwgs.git             "$WORK/xash3d-fwgs"
 	git -C "$WORK/xash3d-fwgs/3rdparty/mainui" checkout --quiet --force "$(upstream mainui_cpp)"
 	checkout hlsdk-portable https://github.com/FWGS/hlsdk-portable.git        "$WORK/hlsdk"
+	checkout hlsdk-portable-opfor  https://github.com/FWGS/hlsdk-portable.git "$WORK/hlsdk_opfor"
+	checkout hlsdk-portable-bshift https://github.com/FWGS/hlsdk-portable.git "$WORK/hlsdk_bshift"
 	checkout ps5-sdl      https://github.com/ps5-payload-dev/SDL.git          "$WORK/ps5_sdl"
 
 	echo "==> Applying XashPS5 patches"
 	git -C "$WORK/xash3d-fwgs"               apply --whitespace=nowarn "$ROOT/patches/xash3d-fwgs-ps5.patch"
 	git -C "$WORK/xash3d-fwgs/3rdparty/mainui" apply --whitespace=nowarn "$ROOT/patches/mainui-ps5.patch"
-	git -C "$WORK/hlsdk"                     apply --whitespace=nowarn "$ROOT/patches/hlsdk-portable-ps5.patch"
+	for h in hlsdk hlsdk_opfor hlsdk_bshift; do
+		git -C "$WORK/$h" apply --whitespace=nowarn "$ROOT/patches/hlsdk-portable-ps5.patch"
+	done
+	git -C "$WORK/ps5_opengl"                apply --whitespace=nowarn "$ROOT/patches/ps5-opengl-sdl2-display-modes.patch"
 	git -C "$WORK/ps5_boilerplate"           apply --whitespace=nowarn "$ROOT/patches/ps5-native-app-boilerplate-ps5.patch"
 fi
 
@@ -47,11 +52,13 @@ make -C "$WORK/ps5_boilerplate" deps app
 SDK="$WORK/ps5_boilerplate/.deps/native/ps5-payload-sdk"
 TOOL="$WORK/ps5_boilerplate/build/host/ps5-native-tool"
 
-echo "==> ps5-opengl: GL 4.6 SDK + SDL2 bridge"
-GL_SDK="$WORK/ps5_opengl/build/sdk/ps5-opengl-gl46"
+echo "==> ps5-opengl SDK 1.0.0 (official release: runtime 1080p/1440p/4K display modes) + SDL2 bridge"
+GL_SDK="$WORK/ps5-opengl-sdk-1.0.0/sdk"
 SDL2_SDK="$WORK/ps5_opengl/build/native-build/sdk"
 if [ ! -f "$GL_SDK/lib/libSceAgc.so" ]; then
-	PS5_PAYLOAD_SDK="$SDK" make -C "$WORK/ps5_opengl" source-fetch sdk-gl46
+	( cd "$WORK" && curl -fsSLO https://github.com/blackbearreloaded/ps5-opengl/releases/download/v1.0.0/ps5-opengl-sdk-1.0.0.tar.gz &&
+	  curl -fsSLO https://github.com/blackbearreloaded/ps5-opengl/releases/download/v1.0.0/ps5-opengl-sdk-1.0.0.tar.gz.sha256 &&
+	  sha256sum -c ps5-opengl-sdk-1.0.0.tar.gz.sha256 && tar xzf ps5-opengl-sdk-1.0.0.tar.gz )
 fi
 if [ ! -d "$SDL2_SDK" ]; then
 	( cd "$WORK/ps5_opengl" && python3 integration/SDL2/build.py native \
@@ -62,12 +69,18 @@ fi
 export PATH="$SDK/bin:$PATH" PS5_PAYLOAD_SDK="$SDK" PS5_OPENGL_SDK="$GL_SDK"
 export LD="$SDK/bin/ld.lld" OBJCOPY="$SDK/bin/llvm-objcopy"
 
-echo "==> hlsdk-portable (Half-Life game logic)"
+echo "==> hlsdk-portable: Half-Life, Opposing Force (gearbox), Blue Shift (bshift) game logic"
+SG="$WORK/static_gamelibs"
 ( cd "$WORK/hlsdk" && python3 waf configure --ps5 && python3 waf build )
-python3 "$ROOT/scripts/build_static_gamelibs.py" "$WORK/hlsdk" "$WORK/static_gamelibs"
+python3 "$ROOT/scripts/build_static_gamelibs.py" "$WORK/hlsdk" "$SG"
+for g in opfor:gearbox bshift:bshift; do
+	src=${g%%:*}; dir=${g##*:}
+	( cd "$WORK/hlsdk_$src" && python3 waf configure --ps5 && python3 waf build )
+	python3 "$ROOT/scripts/build_static_gamelibs.py" "$WORK/hlsdk_$src" "$SG" "$dir"
+done
 
 echo "==> Xash3D FWGS engine (single static binary)"
-export XASH_EXTRA_STATIC_OBJS="server=$WORK/static_gamelibs/server.o,client=$WORK/static_gamelibs/client.o"
+export XASH_EXTRA_STATIC_OBJS="server=$SG/server.o,client=$SG/client.o,server@gearbox=$SG/server_gearbox.o,client@gearbox=$SG/client_gearbox.o,server@bshift=$SG/server_bshift.o,client@bshift=$SG/client_bshift.o"
 ( cd "$WORK/xash3d-fwgs" &&
   python3 waf configure --ps5 --sdl2="$SDL2_SDK" --enable-stbtt --static-linking=filesystem_stdio,ref_gl,menu &&
   python3 waf build )
@@ -89,6 +102,7 @@ d['contentVersion'] = '01.000.000'
 json.dump(d, open(p, 'w'), indent=2)
 EOF
 cp "$ROOT/configs/valve/"*.cfg "$DIST/valve/"
+cp "$WORK/xash3d-fwgs/build/3rdparty/extras/extras.pk3" "$DIST/valve/"   # menu graphics (sliders, checkboxes)
 
 echo
 echo "Done: $DIST"

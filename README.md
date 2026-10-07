@@ -6,7 +6,7 @@ rendered with real hardware OpenGL via
 [ps5-opengl](https://github.com/blackbearreloaded/ps5-opengl) and packaged with
 [ps5-native-app-boilerplate](https://github.com/blackbearreloaded/ps5-native-app-boilerplate).
 
-**Version 1.0** — title `PPSA99999`, shown as *XashPS5 V1.0* on the home screen.
+**Version 1.1** — title `PPSA99999`, shown as *XashPS5 V1.1* on the home screen.
 
 > **No game data is included.** You need your own copy of Half-Life
 > (the `valve` folder from Steam). Valve's files are not, and will never be,
@@ -18,6 +18,11 @@ rendered with real hardware OpenGL via
 - Hardware OpenGL 3.3 Core through the PS5 GPU, **locked 60 FPS** with vsync
 - Half-Life single player and LAN multiplayer (game logic statically linked —
   native titles have no working `dlopen`)
+- **Opposing Force and Blue Shift** (your own `gearbox` / `bshift` folders),
+  switchable from the main menu with *Change game*
+- Render resolution **1080p / 1440p / 4K** from Options → Video
+- Gamepad control of in-game VGUI windows (MOTD, team menus): Cross = OK,
+  Circle / Options = close
 - **Sound** through `sceAudioOut` (mixer at 44.1 kHz, resampled to 48 kHz)
 - **DualSense**: full controller layout, **vibrations** (damage, screen shake, weapon recoil)
 - On-screen keyboard (Xash built-in) for the console, player name, server name…
@@ -49,7 +54,8 @@ into `dist/PPSA99999/`. The first run takes a while (Mesa is compiled).
 
 ## Install
 
-1. Copy your Half-Life `valve` folder into `dist/PPSA99999/valve/`
+1. Copy your Half-Life `valve` folder into `dist/PPSA99999/valve/` (and, if you
+   own them, `gearbox/` and `bshift/` next to it)
    (keep the `userconfig.cfg` and `autoexec.cfg` from this repo — they hold the
    PS5 controls and performance settings; if you already have an
    `autoexec.cfg`, just append its lines).
@@ -59,7 +65,7 @@ into `dist/PPSA99999/`. The first run takes a while (Mesa is compiled).
    # later, engine-only redeploys:
    python3 scripts/deploy.py dist/PPSA99999 <ps5-ip> --only-engine
    ```
-3. Launch **XashPS5 V1.0** from the home screen.
+3. Launch **XashPS5 V1.1** from the home screen.
 
 ## Controls (DualSense)
 
@@ -91,6 +97,9 @@ which starts with `unbindall`).
 | Tiny default heap | 1 GB application heap from ps5-opengl's `app_heap.c` |
 | SDL2 built without audio | `sceAudioOut` backend (`engine/platform/ps5/s_ps5.c`) |
 | ~1 FPS: every immediate-mode draw was a synchronous GPU submit | fans/quads converted to indexed `GL_TRIANGLES`, client indices streamed to a buffer, world drawn through VBOs (`gl_vbo 1`) → driver batches draws, 60 FPS |
+| Combat drops: one GPU submit per model triangle strip | strips/fans of a model mesh expanded into one indexed triangle list (one draw per mesh); decals, sprites and particles converted too |
+| `exit()` raises SIGSYS in a native title | *Quit* closes the app through `sceSystemServiceLoadExec("exit")` |
+| Several games in one title | Half-Life, Opposing Force and Blue Shift game code linked side by side; *Change game* relaunches the title with `-game <dir>` |
 | Logs | every console line mirrored to the kernel log (`sceKernelDebugOutText`) |
 
 ## Known limitations
@@ -98,6 +107,8 @@ which starts with `unbindall`).
 - The PS5 system keyboard (`sceImeDialog`) cannot be resolved from a native title
   yet; Xash's built-in on-screen keyboard is used instead.
 - Internet server browser untested; LAN works.
+- Counter-Strike: the `cstrike` folder launches, but its own game code is not
+  included yet.
 - Debug logging (`-dev 2`, performance counters) is still enabled in this build.
 
 ## License

@@ -2,4 +2,8 @@ work/
 dist/
 *.o
 __pycache__/
-valve/
+# game data is never committed
+/valve/
+/gearbox/
+/bshift/
+/cstrike/

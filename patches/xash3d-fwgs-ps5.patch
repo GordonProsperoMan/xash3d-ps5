@@ -60,16 +60,55 @@ index 9ed62eb..da2a925 100644
  
  	return false;
 diff --git a/engine/common/host.c b/engine/common/host.c
-index f726046..c07732e 100644
+index f726046..95c848f 100644
 --- a/engine/common/host.c
 +++ b/engine/common/host.c
-@@ -654,6 +654,16 @@ static qboolean Host_FilterTime( double time )
+@@ -380,6 +380,38 @@ Host_ChangeGame_f
+ Change game modification
+ =================
+ */
++#if XASH_PS5
++static void Host_PS5Resolution_f( void )
++{
++	int h;
++	FILE *f;
++
++	if( Cmd_Argc() != 2 )
++	{
++		Con_Printf( S_USAGE "ps5_resolution <1080|1440|2160>\n" );
++		return;
++	}
++	h = Q_atoi( Cmd_Argv( 1 ));
++	if( h != 1080 && h != 1440 && h != 2160 )
++	{
++		Con_Printf( "ps5_resolution: 1080, 1440 or 2160\n" );
++		return;
++	}
++	if( h == (int)Cvar_VariableValue( "vid_ps5_height" ))
++		return;
++	f = fopen( "/download0/xash_resolution.txt", "w" );
++	if( !f )
++	{
++		Con_Printf( S_ERROR "ps5_resolution: can't save the setting\n" );
++		return;
++	}
++	fprintf( f, "%d\n", h );
++	fclose( f );
++	// the display mode can only change before EGL starts: relaunch
++	Host_NewInstance( GI->gamefolder, "changing resolution" );
++}
++#endif
++
+ static void Host_ChangeGame_f( void )
+ {
+ 	int	i;
+@@ -654,6 +686,16 @@ static qboolean Host_FilterTime( double time )
  Host_Frame
  =================
  */
 +#if XASH_PS5
 +double ps5_prof_in, ps5_prof_sv, ps5_prof_cl, ps5_prof_swap;
-+static double ps5_prof_counters[8];
++static double ps5_prof_counters[16];
 +__attribute__((visibility("default"))) double *PS5Prof_Counters( void ) { return ps5_prof_counters; }
 +#define ps5_shim_flush_time  ps5_prof_counters[0]
 +#define ps5_shim_flush_count ps5_prof_counters[1]
@@ -80,7 +119,7 @@ index f726046..c07732e 100644
  void Host_Frame( double time )
  {
  	// decide the simulation time
-@@ -665,16 +675,60 @@ void Host_Frame( double time )
+@@ -665,16 +707,62 @@ void Host_Frame( double time )
  	if( host.framecount == 0 )
  		Con_DPrintf( "Time to first frame: %.3f seconds\n", t1 - host.starttime );
  
@@ -124,7 +163,9 @@ index f726046..c07732e 100644
 +		if( now - window_start >= 5.0 )
 +		{
 +			extern double ps5_prof_swap;
-+			Con_Printf( "PS5PERF arrays=%d array_ms=%.2f\n", (int)( ps5_shim_array_count / frames ), 1000.0 * ps5_shim_array_time / frames );
++			Con_Printf( "PS5PERF arrays=%d array_ms=%.2f lm_uploads=%.1f lm_ms=%.2f array_setup_ms=%.2f prog_ms=%.2f upload_ms=%.2f idx_ms=%.2f\n", (int)( ps5_shim_array_count / frames ), 1000.0 * ps5_shim_array_time / frames, ps5_prof_counters[6] / frames, 1000.0 * ps5_prof_counters[5] / frames, 1000.0 * ps5_prof_counters[7] / frames, 1000.0 * ps5_prof_counters[8] / frames, 1000.0 * ps5_prof_counters[9] / frames, 1000.0 * ps5_prof_counters[10] / frames );
++			ps5_prof_counters[7] = ps5_prof_counters[8] = ps5_prof_counters[9] = ps5_prof_counters[10] = 0.0;
++			ps5_prof_counters[5] = ps5_prof_counters[6] = 0.0;
 +			ps5_shim_array_time = 0.0; ps5_shim_array_count = 0;
 +			Con_Printf( "PS5PERF fps=%.1f cpu_ms=%.2f in=%.2f sv=%.2f cl=%.2f swap=%.2f draws=%d verts=%d draw_ms=%.2f state=%d\n", frames / ( now - window_start ),
 +				1000.0 * pure_sum / frames, 1000.0 * ps5_prof_in / frames, 1000.0 * ps5_prof_sv / frames,
@@ -141,8 +182,18 @@ index f726046..c07732e 100644
  }
  
  /*
+@@ -1235,6 +1323,9 @@ int EXPORT Host_Main( int argc, char **argv, const char *progname, int bChangeGa
+ 	if( pChangeGame != NULL && Sys_CanRestart( ))
+ 	{
+ 		Cmd_AddRestrictedCommand( "game", Host_ChangeGame_f, "change game" );
++#if XASH_PS5
++		Cmd_AddRestrictedCommand( "ps5_resolution", Host_PS5Resolution_f, "set render resolution (1080/1440/2160) and restart" );
++#endif
+ 		Cvar_Get( "host_allow_changegame", "1", FCVAR_READ_ONLY, "allows to change games" );
+ 	}
+ 	else
 diff --git a/engine/common/launcher.c b/engine/common/launcher.c
-index 70adc33..e566b37 100644
+index 70adc33..77404ef 100644
 --- a/engine/common/launcher.c
 +++ b/engine/common/launcher.c
 @@ -15,6 +15,8 @@ GNU General Public License for more details.
@@ -154,7 +205,7 @@ index 70adc33..e566b37 100644
  #include "common.h"
  
  #if XASH_SDLMAIN
-@@ -41,6 +43,50 @@ int main( int argc, char **argv )
+@@ -41,10 +43,98 @@ int main( int argc, char **argv )
  #elif XASH_IOS
  	IOS_LaunchDialog();
  	szArgc = IOS_GetArgs( &szArgv );
@@ -176,8 +227,14 @@ index 70adc33..e566b37 100644
 +		static const char *forced_args[] = { "-glcore", "-gl2shim", "-dev", "2", "-console" };
 +		int i, j;
 +
-+		for( i = 0; i < argc && i < 58; i++ )
-+			ps5_argv[i] = argv[i];
++		// argv[0] must be the program name: Sys_CheckParm() scans from index 1.
++		// A normal launch passes argv[0] = "/app0/eboot.bin", but a relaunch
++		// through sceSystemServiceLoadExec passes only the user arguments
++		// ("-game bshift ..."), which would hide "-game" at index 0.
++		i = 0;
++		ps5_argv[i++] = "/app0/eboot.bin";
++		for( j = ( argc > 0 && argv[0] && argv[0][0] != '-' ) ? 1 : 0; j < argc && i < 58; j++ )
++			ps5_argv[i++] = argv[j];
 +		for( j = 0; j < (int)( sizeof( forced_args ) / sizeof( forced_args[0] )); j++ )
 +			ps5_argv[i++] = (char *)forced_args[j];
 +
@@ -198,6 +255,29 @@ index 70adc33..e566b37 100644
 +					ps5_argv[i++] = tok;
 +			}
 +		}
++		// game chosen with "Change game" before the relaunch (see Sys_NewInstance)
++		{
++			static char nextgame[64];
++			qboolean has_game = false;
++			FILE *fp = fopen( "/download0/xash_nextgame.txt", "r" );
++
++			for( j = 0; j < i; j++ )
++				if( ps5_argv[j] && !strcmp( ps5_argv[j], "-game" ))
++					has_game = true;
++			if( fp )
++			{
++				size_t n = fread( nextgame, 1, sizeof( nextgame ) - 1, fp );
++				fclose( fp );
++				remove( "/download0/xash_nextgame.txt" );
++				nextgame[n] = 0;
++				nextgame[strcspn( nextgame, " \t\r\n" )] = 0;
++				if( nextgame[0] && !has_game && i < 61 )
++				{
++					ps5_argv[i++] = "-game";
++					ps5_argv[i++] = nextgame;
++				}
++			}
++		}
 +		ps5_argv[i] = NULL;
 +		szArgc = i;
 +		szArgv = ps5_argv;
@@ -205,6 +285,25 @@ index 70adc33..e566b37 100644
  #else
  	szArgc = argc;
  	szArgv = argv;
+ #endif // XASH_PSVITA
++#if XASH_PS5
++	{
++		// Native titles must never return from main()/call exit(): the CRT's
++		// exit path raises SIGSYS and the system reports a crash. Ask the
++		// system to close the app instead (same service as the game-switch
++		// relaunch), and keep the thread parked if it does not act at once.
++		extern int sceSystemServiceLoadExec( const char *path, char *const argv[] );
++		extern unsigned int sleep( unsigned int seconds );
++		int ret = Host_Main( szArgc, szArgv, XASH_GAMEDIR, 0, Sys_ChangeGame );
++		printf( "[XASH] Host_Main returned %d, closing the application\n", ret );
++		sceSystemServiceLoadExec( "exit", NULL );
++		for( ;; )
++			sleep( 1 );
++	}
++#endif
+ 	return Host_Main( szArgc, szArgv, XASH_GAMEDIR, 0, Sys_ChangeGame );
+ }
+ #endif // XASH_ENABLE_MAIN
 diff --git a/engine/common/lib_static.c b/engine/common/lib_static.c
 new file mode 100644
 index 0000000..e69de29
@@ -286,6 +385,101 @@ index b4e5bb2..41a1ce8 100644
  #if XASH_PSVITA
  	// spew to stderr only in developer mode
  	if( host_developer.value )
+diff --git a/engine/common/system.c b/engine/common/system.c
+index 92aa2e4..dd68899 100644
+--- a/engine/common/system.c
++++ b/engine/common/system.c
+@@ -528,7 +528,7 @@ Returns true if execv-like syscall is available
+ */
+ qboolean Sys_CanRestart( void )
+ {
+-#if XASH_NSWITCH || XASH_PSVITA
++#if XASH_NSWITCH || XASH_PSVITA || XASH_PS5
+ 	return true;
+ #elif XASH_IOS
+ 	return false;
+@@ -550,11 +550,43 @@ but since engine will be unloaded during this call
+ it explicitly doesn't use internal allocation or string copy utils
+ ==================
+ */
++#if XASH_PS5
++int sceSystemServiceLoadExec( const char *path, char *const argv[] );
++#define PS5_NEXTGAME_FILE "/download0/xash_nextgame.txt"
++#include <unistd.h>
++#endif
++
+ qboolean Sys_NewInstance( const char *gamedir, const char *finalmsg )
+ {
+ 	qboolean replaced_arg = false;
+ 
+-#if XASH_NSWITCH
++#if XASH_PS5
++	// No execv for native titles. Remember the requested game (read back by
++	// launcher.c on the next start), then ask the system to relaunch our own
++	// eboot. If LoadExec is refused, exit: the user restarts the app from the
++	// home screen and lands directly in the chosen game.
++	{
++		static char game_arg[64];
++		static char *ps5_args[] = { "-game", game_arg, "-changegame", NULL };
++		FILE *f = fopen( PS5_NEXTGAME_FILE, "w" );
++		int ret;
++
++		Q_strncpy( game_arg, gamedir, sizeof( game_arg ));
++		if( f )
++		{
++			fputs( gamedir, f );
++			fclose( f );
++		}
++		Con_Printf( "Switching to game '%s' (saved: %s)\n", gamedir, f ? "yes" : "NO" );
++		Host_ShutdownWithReason( finalmsg );
++		ret = sceSystemServiceLoadExec( "/app0/eboot.bin", ps5_args );
++		printf( "[XASH] sceSystemServiceLoadExec returned 0x%x\n", ret );
++		sceSystemServiceLoadExec( "exit", NULL ); // never exit(): SIGSYS on native titles
++		for( ;; )
++			sleep( 1 );
++	}
++	(void)replaced_arg;
++#elif XASH_NSWITCH
+ 	char newargs[4096];
+ 	const char *exe = host.argv[0]; // arg 0 is always the full NRO path
+ 
+diff --git a/engine/platform/misc/lib_static.c b/engine/platform/misc/lib_static.c
+index 2814c6a..bb8b554 100644
+--- a/engine/platform/misc/lib_static.c
++++ b/engine/platform/misc/lib_static.c
+@@ -38,8 +38,32 @@ static void *Lib_Find(table_t *tbl, const char *name )
+ 	return 0;
+ }
+ 
++#if XASH_PS5
++// Several games are linked into the one eboot. Each game's server/client
++// export tables are registered as "<name>@<gamedir>" (e.g. "server@gearbox");
++// plain "server"/"client" is Half-Life (valve) and the fallback for mods
++// that reuse the Half-Life game code.
++#include "common.h"
++#endif
++
+ void *COM_LoadLibrary( const char *dllname, int build_ordinals_table, qboolean directpath )
+ {
++#if XASH_PS5
++	if( !Q_strcmp( dllname, "server" ) || !Q_strcmp( dllname, "client" ))
++	{
++		char scoped[64];
++		void *p;
++
++		Q_snprintf( scoped, sizeof( scoped ), "%s@%s", dllname, GI->gamefolder );
++		p = Lib_Find((table_t*)libs, scoped );
++		if( p )
++		{
++			Con_Printf( "Static game library: %s\n", scoped );
++			return p;
++		}
++		Con_Printf( "Static game library: %s (Half-Life game code for %s)\n", dllname, GI->gamefolder );
++	}
++#endif
+ 	return Lib_Find((table_t*)libs, dllname);
+ }
+ 
 diff --git a/engine/platform/platform.h b/engine/platform/platform.h
 index 4a3afa4..34f8c16 100644
 --- a/engine/platform/platform.h
@@ -1555,11 +1749,38 @@ index 99d45b0..653586c 100644
  #endif // SDL_VERSION_ATLEAST( 2, 0, 9 )
  }
  
+diff --git a/engine/platform/sdl2/sys_sdl2.c b/engine/platform/sdl2/sys_sdl2.c
+index ac3a43c..f3701f0 100644
+--- a/engine/platform/sdl2/sys_sdl2.c
++++ b/engine/platform/sdl2/sys_sdl2.c
+@@ -127,6 +127,22 @@ void SDLash_Init( void )
+ 		SDL_setenv( "SDL_GAMECONTROLLER_IGNORE_DEVICES", "0x28DE/0x11FF", 1 );
+ 	}
+ 
++#if XASH_PS5
++	// render resolution chosen in Video options (ps5_resolution command),
++	// applied by the SDL G19 driver before EGL initialisation
++	{
++		char res[16] = "";
++		FILE *f = fopen( "/download0/xash_resolution.txt", "r" );
++		if( f )
++		{
++			if( fgets( res, sizeof( res ), f ))
++				res[strcspn( res, " \t\r\n" )] = 0;
++			fclose( f );
++		}
++		if( res[0] )
++			SDL_SetHint( "SDL_PS5_RESOLUTION", res );
++	}
++#endif
+ 	if( SDL_Init( SDL_INIT_TIMER | SDL_INIT_VIDEO | SDL_INIT_EVENTS ) )
+ 	{
+ 		Sys_Warn( "SDL_Init failed: %s", SDL_GetError() );
 diff --git a/engine/platform/sdl2/vid_sdl2.c b/engine/platform/sdl2/vid_sdl2.c
-index e85afd2..b073731 100644
+index e85afd2..66a9cd8 100644
 --- a/engine/platform/sdl2/vid_sdl2.c
 +++ b/engine/platform/sdl2/vid_sdl2.c
-@@ -661,6 +661,20 @@ VID_CreateWindow
+@@ -661,6 +661,30 @@ VID_CreateWindow
  static rserr_t VID_CreateWindow( const int input_width, const int input_height, window_mode_t window_mode )
  {
  	rserr_t err;
@@ -1573,6 +1794,16 @@ index e85afd2..b073731 100644
 +	// engine (see integration/SDL2/SDL_ps5g19.c create_window()).
 +	Uint32 flags = SDL_WINDOW_HIDDEN;
 +	SDL_Rect rect = { SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1920, 1080 };
++	{
++		// the G19 driver exposes exactly one mode: 1080p, 1440p or 2160p
++		SDL_DisplayMode dm;
++		if( SDL_GetDesktopDisplayMode( 0, &dm ) == 0 && dm.w > 0 && dm.h > 0 )
++		{
++			rect.w = dm.w;
++			rect.h = dm.h;
++		}
++		Cvar_FullSet( "vid_ps5_height", va( "%d", rect.h ), FCVAR_READ_ONLY );
++	}
 +
 +	if( !glw_state.software )
 +		SetBits( flags, SDL_WINDOW_OPENGL );
@@ -1580,7 +1811,7 @@ index e85afd2..b073731 100644
  	Uint32 flags = SDL_WINDOW_HIDDEN | SDL_WINDOW_RESIZABLE;
  	SDL_Rect rect = { SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, input_width, input_height };
  
-@@ -674,6 +688,7 @@ static rserr_t VID_CreateWindow( const int input_width, const int input_height,
+@@ -674,6 +698,7 @@ static rserr_t VID_CreateWindow( const int input_width, const int input_height,
  
  	if( vid_maximized.value )
  		SetBits( flags, SDL_WINDOW_MAXIMIZED );
@@ -1588,7 +1819,7 @@ index e85afd2..b073731 100644
  
  	// by default we create window in windowed mode because we don't know
  	// if window creation failed because of invalid video mode or any other reason
-@@ -801,7 +816,14 @@ static void GL_SetupAttributes( void )
+@@ -801,7 +826,14 @@ static void GL_SetupAttributes( void )
  
  void GL_SwapBuffers( void )
  {
@@ -1719,7 +1950,7 @@ index 2c1ed0f..31249c2 100644
  	{
  		// check if we need to generate gameinfo for Quake
 diff --git a/filesystem/searchpath.c b/filesystem/searchpath.c
-index 6ffbd4b..ed7d783 100644
+index 6ffbd4b..860d631 100644
 --- a/filesystem/searchpath.c
 +++ b/filesystem/searchpath.c
 @@ -18,11 +18,17 @@ GNU General Public License for more details.
@@ -1752,7 +1983,21 @@ index 6ffbd4b..ed7d783 100644
  
  	FI.GameInfo = FI.games[i];
  
-@@ -657,6 +666,23 @@ qboolean FS_InitStdio( qboolean unused_set_to_true, const char *rootdir, const c
+@@ -570,7 +579,12 @@ static void FS_ValidateDirectories( const char *path, qboolean *has_base_dir, qb
+ 
+ 	for( int i = 0; i < dirs.numstrings; i++ )
+ 	{
+-		if( !FS_SysFolderExists( dirs.strings[i] ))
++		// listdirectory() returns bare names: test them under the listed path,
++		// not relative to the current directory (they differ for the read-only
++		// root, e.g. /app0 on PS5 while the cwd is the writable /download0)
++		char full[MAX_SYSPATH];
++		Q_snprintf( full, sizeof( full ), "%s/%s", path, dirs.strings[i] );
++		if( !FS_SysFolderExists( full ))
+ 			continue;
+ 
+ 		if( !Q_stricmp( fs_basedir, dirs.strings[i] ))
+@@ -657,6 +671,23 @@ qboolean FS_InitStdio( qboolean unused_set_to_true, const char *rootdir, const c
  		stringlistinit( &dirs );
  		listdirectory( &dirs, fs_rodir, true );
  		stringlistsort( &dirs );
@@ -1777,18 +2022,20 @@ index 6ffbd4b..ed7d783 100644
  		for( int i = 0; i < dirs.numstrings; i++ )
  		{
 diff --git a/ref/gl/gl2_shim/gl2_shim.c b/ref/gl/gl2_shim/gl2_shim.c
-index 91541c9..3fb693d 100644
+index 91541c9..b37131d 100644
 --- a/ref/gl/gl2_shim/gl2_shim.c
 +++ b/ref/gl/gl2_shim/gl2_shim.c
-@@ -101,6 +101,7 @@ static struct
+@@ -101,6 +101,9 @@ static struct
  	gl2wrap_prog_t *cur_prog;
  	GLboolean uchanged;
  	GLuint triquads_ibo[4];
 +	GLuint trifan_ibo; // PS5: fan -> triangle list (0,1,2, 0,2,3, ...)
++	GLuint tristrip_ibo; // PS5: strip -> triangle list (0,1,2, 2,1,3, ...)
++	GLuint identity_ibo; // PS5: non-indexed triangle list -> indexed (0,1,2,3...)
  } gl2wrap;
  
  static struct
-@@ -462,6 +463,25 @@ static void GL2_InitTriQuads( void )
+@@ -462,6 +465,43 @@ static void GL2_InitTriQuads( void )
  		pglBufferDataARB( GL_ELEMENT_ARRAY_BUFFER_ARB, sizeof( triquads_array ), triquads_array, GL_STATIC_DRAW_ARB );
  	}
  
@@ -1809,12 +2056,30 @@ index 91541c9..3fb693d 100644
 +		pglGenBuffersARB( 1, &gl2wrap.trifan_ibo );
 +		rpglBindBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB, gl2wrap.trifan_ibo );
 +		pglBufferDataARB( GL_ELEMENT_ARRAY_BUFFER_ARB, sizeof( fan_array ), fan_array, GL_STATIC_DRAW_ARB );
++
++		// strips keep a consistent winding by swapping the first two vertices
++		// of every odd triangle
++		for( int j = 0; j < MAX_BEGINEND_VERTS - 2; j++ )
++		{
++			fan_array[j * 3]     = ( j & 1 ) ? j + 1 : j;
++			fan_array[j * 3 + 1] = ( j & 1 ) ? j : j + 1;
++			fan_array[j * 3 + 2] = j + 2;
++		}
++		pglGenBuffersARB( 1, &gl2wrap.tristrip_ibo );
++		rpglBindBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB, gl2wrap.tristrip_ibo );
++		pglBufferDataARB( GL_ELEMENT_ARRAY_BUFFER_ARB, sizeof( fan_array ), fan_array, GL_STATIC_DRAW_ARB );
++
++		for( int j = 0; j < MAX_BEGINEND_VERTS; j++ )
++			fan_array[j] = j;
++		pglGenBuffersARB( 1, &gl2wrap.identity_ibo );
++		rpglBindBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB, gl2wrap.identity_ibo );
++		pglBufferDataARB( GL_ELEMENT_ARRAY_BUFFER_ARB, MAX_BEGINEND_VERTS * sizeof( fan_array[0] ), fan_array, GL_STATIC_DRAW_ARB );
 +	}
 +#endif
  	rpglBindBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB, 0 );
  }
  
-@@ -868,7 +888,30 @@ static void GL2_UpdateIncrementalBuffer( gl2wrap_prog_t *prog, int count )
+@@ -868,7 +908,31 @@ static void GL2_UpdateIncrementalBuffer( gl2wrap_prog_t *prog, int count )
  	}
  }
  
@@ -1823,7 +2088,8 @@ index 91541c9..3fb693d 100644
 +// counters live in the engine (ref_gl is a static module with a stripped
 +// export table); resolved through the engine's own exported helper
 +extern double *PS5Prof_Counters( void ) __attribute__((weak));
-+static double ps5_dummy[8];
++static double ps5_dummy[16];
++#define PS5_PROF( i ) ( PS5Prof_Counters ? PS5Prof_Counters() : ps5_dummy )[i]
 +#define ps5_shim_flush_time  ( PS5Prof_Counters ? PS5Prof_Counters() : ps5_dummy )[0]
 +#define ps5_shim_flush_count ( PS5Prof_Counters ? PS5Prof_Counters() : ps5_dummy )[1]
 +#define ps5_shim_flush_verts ( PS5Prof_Counters ? PS5Prof_Counters() : ps5_dummy )[2]
@@ -1845,7 +2111,7 @@ index 91541c9..3fb693d 100644
  {
  	int startindex = 0;
  	GLuint flags = gl2wrap.cur_flags;
-@@ -948,6 +991,17 @@ static void GL2_FlushPrims( void )
+@@ -948,6 +1012,33 @@ static void GL2_FlushPrims( void )
  		gl2wrap.attrbufcycle = ( gl2wrap.attrbufcycle + 1 ) % gl2wrap_config.cycle_buffers;
  	}
  
@@ -1858,12 +2124,58 @@ index 91541c9..3fb693d 100644
 +			GL_UNSIGNED_SHORT, NULL, startindex );
 +		pglBindBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB, 0 );
 +	}
++	else if(( gl2wrap.prim == GL_TRIANGLE_STRIP || gl2wrap.prim == GL_QUAD_STRIP )
++		&& count >= 3 && count <= MAX_BEGINEND_VERTS && pglDrawRangeElementsBaseVertex && gl2wrap.tristrip_ibo )
++	{
++		pglBindBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB, gl2wrap.tristrip_ibo );
++		pglDrawRangeElementsBaseVertex( GL_TRIANGLES, 0, count - 1, ( count - 2 ) * 3,
++			GL_UNSIGNED_SHORT, NULL, startindex );
++		pglBindBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB, 0 );
++	}
++	else if( gl2wrap.prim == GL_TRIANGLES && count >= 3 && count <= MAX_BEGINEND_VERTS
++		&& pglDrawRangeElementsBaseVertex && gl2wrap.identity_ibo )
++	{
++		pglBindBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB, gl2wrap.identity_ibo );
++		pglDrawRangeElementsBaseVertex( GL_TRIANGLES, 0, count - 1, count - count % 3,
++			GL_UNSIGNED_SHORT, NULL, startindex );
++		pglBindBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB, 0 );
++	}
 +	else
 +#endif
  	if( gl2wrap.prim == GL_QUADS )
  	{
  		// simple case, one quad may draw like polygon(4)
-@@ -1700,19 +1754,93 @@ static void GL2_SetupArrays( GLuint start, GLuint end )
+@@ -1616,7 +1707,13 @@ static void GL2_SetupArrays( GLuint start, GLuint end )
+ 		SetBits( flags, BIT( GL2_FLAG_ALPHA_TEST ));
+ 	if( gl2wrap_state.fog )
+ 		SetBits( flags, BIT( GL2_FLAG_FOG ));
++#if XASH_PS5
++	double ps5_tp = gEngfuncs.pfnTime();
++#endif
+ 	gl2wrap_prog_t *prog = GL2_SetProg( flags );// | GL2_ATTR_TEXCOORD0 );
++#if XASH_PS5
++	PS5_PROF( 8 ) += gEngfuncs.pfnTime() - ps5_tp;
++#endif
+ 	if( !prog )
+ 		return;
+ 
+@@ -1677,7 +1774,15 @@ static void GL2_SetupArrays( GLuint start, GLuint end )
+ 					GL2_UpdateIncrementalArrayBuffer( prog, size, offset, start, end, stride, i );
+ 					continue;
+ 				}
++#if XASH_PS5
++				{
++					double ps5_tu = gEngfuncs.pfnTime();
++					GL2_UpdatePersistentArrayBuffer( prog, size, offset, start, end, stride, i );
++					PS5_PROF( 9 ) += gEngfuncs.pfnTime() - ps5_tu;
++				}
++#else
+ 				GL2_UpdatePersistentArrayBuffer( prog, size, offset, start, end, stride, i );
++#endif
+ 			}
+ 			else
+ 			{
+@@ -1700,19 +1805,97 @@ static void GL2_SetupArrays( GLuint start, GLuint end )
  	rpglBindBufferARB( GL_ARRAY_BUFFER_ARB, gl2wrap_state.vbo );
  }
  
@@ -1922,7 +2234,7 @@ index 91541c9..3fb693d 100644
 +	ps5_index_offset += bytes;
 +	return true;
 +}
-+#define PS5_INDICES_BEGIN qboolean ps5_streamed = PS5_StreamIndices( count, type, &indices );
++#define PS5_INDICES_BEGIN double ps5_ti = gEngfuncs.pfnTime(); qboolean ps5_streamed = PS5_StreamIndices( count, type, &indices ); PS5_PROF( 10 ) += gEngfuncs.pfnTime() - ps5_ti;
 +#define PS5_INDICES_END if( ps5_streamed ) rpglBindBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB, 0 );
 +#else
 +#define PS5_INDICES_BEGIN
@@ -1950,6 +2262,10 @@ index 91541c9..3fb693d 100644
 -		rpglDrawRangeElements( mode, start, end, count, type, indices );
 -	else
 -		rpglDrawElements( mode, count, type, indices );
++#if XASH_PS5
++	double ps5_t1 = gEngfuncs.pfnTime();
++	( PS5Prof_Counters ? PS5Prof_Counters() : ps5_dummy )[7] += ps5_t1 - ps5_t0; // setup (uploads, program, attribs)
++#endif
 +	{
 +		PS5_INDICES_BEGIN
 +		if( rpglDrawRangeElements )
@@ -1962,17 +2278,227 @@ index 91541c9..3fb693d 100644
  }
  
  static void APIENTRY GL2_DrawArrays( GLenum mode, GLint first, GLsizei count )
-@@ -1721,8 +1849,10 @@ static void APIENTRY GL2_DrawArrays( GLenum mode, GLint first, GLsizei count )
+@@ -1721,8 +1904,34 @@ static void APIENTRY GL2_DrawArrays( GLenum mode, GLint first, GLsizei count )
  		return;
  
  	// vertices referenced are [first, first + count - 1], and first may be nonzero
 +	PS5_ARRAY_BEGIN
  	GL2_SetupArrays( 0, first + count - 1 );
++#if XASH_PS5
++	// the PS5 driver only batches indexed GL_TRIANGLES; non-indexed fans and
++	// strips (decals, sprites...) force a full submission per draw. Reuse the
++	// static fan/strip -> triangle-list index buffers.
++	if(( mode == GL_TRIANGLE_FAN || mode == GL_POLYGON || mode == GL_TRIANGLE_STRIP )
++		&& count >= 3 && count <= MAX_BEGINEND_VERTS && pglDrawRangeElementsBaseVertex
++		&& gl2wrap.trifan_ibo && gl2wrap.tristrip_ibo )
++	{
++		pglBindBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB,
++			mode == GL_TRIANGLE_STRIP ? gl2wrap.tristrip_ibo : gl2wrap.trifan_ibo );
++		pglDrawRangeElementsBaseVertex( GL_TRIANGLES, 0, count - 1, ( count - 2 ) * 3,
++			GL_UNSIGNED_SHORT, NULL, first );
++		pglBindBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB, 0 );
++	}
++	else if( mode == GL_TRIANGLES && count >= 3 && count <= MAX_BEGINEND_VERTS
++		&& pglDrawRangeElementsBaseVertex && gl2wrap.identity_ibo )
++	{
++		pglBindBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB, gl2wrap.identity_ibo );
++		pglDrawRangeElementsBaseVertex( GL_TRIANGLES, 0, count - 1, count - count % 3,
++			GL_UNSIGNED_SHORT, NULL, first );
++		pglBindBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB, 0 );
++	}
++	else
++#endif
  	rpglDrawArrays( mode, first, count );
 +	PS5_ARRAY_END
  }
  
  static void APIENTRY GL2_BindBufferARB( GLenum buf, GLuint obj )
+diff --git a/ref/gl/gl_rsurf.c b/ref/gl/gl_rsurf.c
+index 18dea06..0fac984 100644
+--- a/ref/gl/gl_rsurf.c
++++ b/ref/gl/gl_rsurf.c
+@@ -684,7 +684,23 @@ static void LM_UploadDynamicBlock( void )
+ 	pglTexSubImage2D( GL_TEXTURE_2D, 0, 0, 0, BLOCK_SIZE, gl_lms.atlas.max_height, GL_RGBA, GL_UNSIGNED_BYTE, gl_lms.lightmap_buffer );
+ }
+ 
++#if XASH_PS5
++extern double *PS5Prof_Counters( void ) __attribute__((weak));
++static void LM_UploadBlock_Real( qboolean dynamic );
+ static void LM_UploadBlock( qboolean dynamic )
++{
++	double t0 = gEngfuncs.pfnTime();
++	LM_UploadBlock_Real( dynamic );
++	if( PS5Prof_Counters )
++	{
++		PS5Prof_Counters()[5] += gEngfuncs.pfnTime() - t0;
++		PS5Prof_Counters()[6] += 1;
++	}
++}
++static void LM_UploadBlock_Real( qboolean dynamic )
++#else
++static void LM_UploadBlock( qboolean dynamic )
++#endif
+ {
+ 	if( dynamic )
+ 	{
+diff --git a/ref/gl/gl_studio.c b/ref/gl/gl_studio.c
+index 39873fb..c2a6a7a 100644
+--- a/ref/gl/gl_studio.c
++++ b/ref/gl/gl_studio.c
+@@ -1589,6 +1589,119 @@ static int R_StudioMeshCompare( const void *a, const void *b )
+ 	return 0;
+ }
+ 
++#if XASH_PS5
++/*
++===============
++R_StudioDrawMeshPS5
++
++PS5: the G19 driver submits every Begin/End separately unless it is an indexed
++triangle list, so a model made of dozens of short strips/fans costs dozens of
++full submissions. Expand all strips and fans of a mesh into one GL_TRIANGLES
++batch (one draw per mesh). mode: 0 normal, 1 float texcoords, 2 chrome.
++===============
++*/
++#define PS5_STRIP_MAX 512
++#define PS5_BATCH_MAX 8100
++typedef struct { rgba_t c; float st[2]; vec3_t v; } ps5_svert_t;
++static void R_StudioEmitPS5( const ps5_svert_t *sv )
++{
++	pglColor4ubv( sv->c );
++	pglTexCoord2f( sv->st[0], sv->st[1] );
++	pglVertex3fv( sv->v );
++}
++
++static void R_StudioDrawMeshPS5( short *ptricmds, vec3_t *pstudionorms, float s, float t, float scale, int mode )
++{
++	static ps5_svert_t sv[PS5_STRIP_MAX];
++	qboolean glowShell = scale > 0.0f;
++	int i, emitted = 0;
++
++	pglBegin( GL_TRIANGLES );
++	while(( i = *( ptricmds++ )))
++	{
++		qboolean fan = i < 0;
++		int n = 0;
++
++		if( fan )
++			i = -i;
++
++		for( ; i > 0; i--, ptricmds += 4 )
++		{
++			ps5_svert_t *v = &sv[n < PS5_STRIP_MAX ? n : PS5_STRIP_MAX - 1];
++
++			if( mode == 2 )
++			{
++				int idx;
++				if( glowShell )
++				{
++					color24 *clr = &RI.currententity->curstate.rendercolor;
++					idx = g_studio.normaltable[ptricmds[0]];
++					VectorMA( g_studio.verts[ptricmds[0]], scale, g_studio.norms[ptricmds[0]], v->v );
++					v->c[0] = clr->r; v->c[1] = clr->g; v->c[2] = clr->b; v->c[3] = 255;
++				}
++				else
++				{
++					idx = ptricmds[1];
++					R_StudioSetColorArray( ptricmds, pstudionorms, v->c );
++					VectorCopy( g_studio.verts[ptricmds[0]], v->v );
++				}
++				v->st[0] = g_studio.chrome[idx][0] * s;
++				v->st[1] = g_studio.chrome[idx][1] * t;
++			}
++			else
++			{
++				R_StudioSetColorArray( ptricmds, pstudionorms, v->c );
++				if( mode == 1 )
++				{
++					v->st[0] = HalfToFloat( ptricmds[2] );
++					v->st[1] = HalfToFloat( ptricmds[3] );
++				}
++				else
++				{
++					v->st[0] = ptricmds[2] * s;
++					v->st[1] = ptricmds[3] * t;
++				}
++				VectorCopy( g_studio.verts[ptricmds[0]], v->v );
++			}
++			n++;
++		}
++		if( n > PS5_STRIP_MAX )
++			n = PS5_STRIP_MAX; // never happens with valid models
++
++		if( emitted + ( n - 2 ) * 3 > PS5_BATCH_MAX )
++		{
++			pglEnd();
++			pglBegin( GL_TRIANGLES );
++			emitted = 0;
++		}
++
++		for( int j = 0; j + 2 < n; j++ )
++		{
++			if( fan )
++			{
++				R_StudioEmitPS5( &sv[0] );
++				R_StudioEmitPS5( &sv[j + 1] );
++				R_StudioEmitPS5( &sv[j + 2] );
++			}
++			else if( j & 1 )
++			{
++				R_StudioEmitPS5( &sv[j + 1] );
++				R_StudioEmitPS5( &sv[j] );
++				R_StudioEmitPS5( &sv[j + 2] );
++			}
++			else
++			{
++				R_StudioEmitPS5( &sv[j] );
++				R_StudioEmitPS5( &sv[j + 1] );
++				R_StudioEmitPS5( &sv[j + 2] );
++			}
++			emitted += 3;
++		}
++	}
++	pglEnd();
++}
++#endif
++
+ /*
+ ===============
+ R_StudioDrawNormalMesh
+@@ -1930,6 +2043,15 @@ static void R_StudioSubmitMesh( short *ptricmds, vec3_t *pstudionorms, float s,
+ 	}
+ 	else
+ 	{
++#if XASH_PS5
++		if( FBitSet( g_nFaceFlags, STUDIO_NF_CHROME ))
++			R_StudioDrawMeshPS5( ptricmds, pstudionorms, s, t, shellscale, 2 );
++		else if( FBitSet( g_nFaceFlags, STUDIO_NF_UV_COORDS ))
++			R_StudioDrawMeshPS5( ptricmds, pstudionorms, 1.0f, 1.0f, 0.0f, 1 );
++		else
++			R_StudioDrawMeshPS5( ptricmds, pstudionorms, s, t, 0.0f, 0 );
++		return;
++#endif
+ 		if( FBitSet( g_nFaceFlags, STUDIO_NF_CHROME ))
+ 			R_StudioDrawChromeMesh( ptricmds, pstudionorms, s, t, shellscale );
+ 		else if( FBitSet( g_nFaceFlags, STUDIO_NF_UV_COORDS ))
+diff --git a/scripts/ps5-bss-symbols.ld b/scripts/ps5-bss-symbols.ld
+new file mode 100644
+index 0000000..f8d52a6
+--- /dev/null
++++ b/scripts/ps5-bss-symbols.ld
+@@ -0,0 +1,12 @@
++/* Weak bss/image-end bookkeeping symbols referenced by libc/crt startup
++ * code on this target. ps5-pie.ld doesn't define a symbol exactly named
++ * __bss_start/__bss_end/__image_end, and lld's --version-script rejects
++ * assigning "local" visibility to an undefined symbol -- so the compiled
++ * weak references leaked into the dynamic symbol table and the PS5
++ * packaging tool then demanded a public SDK stub for them. Provide real
++ * (weak) definitions here instead, pointing at the actual .bss bounds.
++ */
++PROVIDE(__bss_start = ADDR(.bss));
++PROVIDE(__bss_end = ADDR(.bss) + SIZEOF(.bss));
++PROVIDE(__image_end = ADDR(.bss) + SIZEOF(.bss));
++PROVIDE(__image_start = 0);
 diff --git a/scripts/ps5-hide-internal-symbols.map b/scripts/ps5-hide-internal-symbols.map
 new file mode 100644
 index 0000000..97b73d1
@@ -2226,7 +2752,7 @@ index 53736ee..0fca7a7 100644
  		values = conf.options.PSP_OPTS.split(',')
  		if len(values) != 3:
 diff --git a/scripts/waifulib/xshlib.py b/scripts/waifulib/xshlib.py
-index 72e673a..0b2414e 100644
+index 72e673a..34e086c 100644
 --- a/scripts/waifulib/xshlib.py
 +++ b/scripts/waifulib/xshlib.py
 @@ -40,7 +40,7 @@ class objcopy_relocatable_lib(Task.Task):
@@ -2238,7 +2764,7 @@ index 72e673a..0b2414e 100644
  
  	def add_target(self, target):
  		"create objcopy task for target"
-@@ -68,13 +68,20 @@ class cxxprogram_static(cxx.cxxprogram):
+@@ -68,15 +68,25 @@ class cxxprogram_static(cxx.cxxprogram):
  # usevars are same
  ccroot.USELIB_VARS['cprogram_static'] = ccroot.USELIB_VARS['cxxprogram_static'] = ccroot.USELIB_VARS['cxxprogram']
  
@@ -2253,14 +2779,21 @@ index 72e673a..0b2414e 100644
  		"generate library list"
  
 -		libraries = reloc
+-		externs = '\n'.join(['extern table_t lib_%s_exports[];' % e for e in libraries])
+-		table = '\n'.join(['{ "%s", &lib_%s_exports },' % (e, e) for e in libraries])
 +		# Extra prebuilt relocatable libs (e.g. HLSDK server/client on PS5,
 +		# where native titles have no working dlopen): XASH_EXTRA_STATIC_OBJS
 +		# = "server=/abs/server.o,client=/abs/client.o"
++		# names may be game-scoped: "server@gearbox=/abs/opfor_server.o" registers
++		# the table lib_server_gearbox_exports under the lookup key "server@gearbox"
 +		libraries = list(reloc) + [e.split('=')[0] for e in extra_static_objs()]
- 		externs = '\n'.join(['extern table_t lib_%s_exports[];' % e for e in libraries])
- 		table = '\n'.join(['{ "%s", &lib_%s_exports },' % (e, e) for e in libraries])
++		sym = lambda e: e.replace('@', '_')
++		externs = '\n'.join(['extern table_t lib_%s_exports[];' % sym(e) for e in libraries])
++		table = '\n'.join(['{ "%s", &lib_%s_exports },' % (e, sym(e)) for e in libraries])
  		out_node.write('%s\nstruct {const char *name;void *func;} libs[] = {\n%s\n{0,0}\n};\n' % (externs, table ))
-@@ -113,3 +120,5 @@ def apply_static(main, *reloc):
+ 
+ 
+@@ -113,3 +123,5 @@ def apply_static(main, *reloc):
  
  			for t in reloc:
  				self.source += [self.bld.get_tgen_by_name(t).objcopy_task.outputs[0]]

@@ -255,3 +255,100 @@ index 4d1a382..0c20760 100644
  	console.SetCoord( hoffset, yoffset );
  	yoffset -= ygap;
  
+diff --git a/menus/VideoModes.cpp b/menus/VideoModes.cpp
+index 28f1ef6..13d1069 100644
+--- a/menus/VideoModes.cpp
++++ b/menus/VideoModes.cpp
+@@ -35,10 +35,14 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+ //   out of sync with the vid mode strings list
+ //   Doing this, however, will require API extension
+ 
++class CMenuVidModes;
++static CMenuVidModes *g_pVidModesMenu; // gamepad: Cross on a resolution applies it
++
+ class CMenuVidModesModel : public CMenuBaseArrayModel
+ {
+ public:
+ 	void Update() override;
++	void OnActivateEntry( int line ) override;
+ 	int GetRows() const override
+ 	{
+ 		return m_szModes.Count();
+@@ -138,6 +142,15 @@ void CMenuVidModesModel::Update()
+ {
+ 	m_szModes.Purge();
+ 
++#if defined(__FreeBSD__) // PS5: fixed render resolutions, applied by restarting
++	if( EngFuncs::GetCvarFloat( "vid_ps5_height" ) > 0 )
++	{
++		m_szModes.AddToTail( "1920 x 1080 (1080p)" );
++		m_szModes.AddToTail( "2560 x 1440 (1440p)" );
++		m_szModes.AddToTail( "3840 x 2160 (4K)" );
++		return;
++	}
++#endif
+ 	for( int i = 0; ; i++ )
+ 	{
+ 		const char *mode = EngFuncs::GetModeString( i );
+@@ -220,6 +233,13 @@ void CMenuVidModes::GetConfig()
+ 	fullscreen = bound( 0, fullscreen, 2 ); // windowed, fullscreen, borderless
+ 
+ 	float vid_mode = EngFuncs::GetCvarFloat( "vid_mode" );
++#if defined(__FreeBSD__)
++	{
++		int h = (int)EngFuncs::GetCvarFloat( "vid_ps5_height" );
++		if( h > 0 )
++			vid_mode = h >= 2160 ? 2 : h >= 1440 ? 1 : 0;
++	}
++#endif
+ 	vid_mode = bound( 0, vid_mode, vidListModel.GetRows( ));
+ 
+ 	windowMode.SetCurrentValue( fullscreen );
+@@ -283,6 +303,15 @@ void CMenuVidModes::SetConfig( )
+ 	if( isWindowedModeChanged )
+ 		EngFuncs::CvarSetValue( "fullscreen", currentWindowModeIndex );
+ 
++#if defined(__FreeBSD__)
++	if( isVidModeChanged && EngFuncs::GetCvarFloat( "vid_ps5_height" ) > 0 )
++	{
++		static const int heights[] = { 1080, 1440, 2160 };
++		vsync.WriteCvar();
++		EngFuncs::ClientCmdF( false, "ps5_resolution %d\n", heights[bound( 0, currentModeIndex, 2 )] );
++		return;
++	}
++#endif
+ 	if( isVidModeChanged )
+ 	{
+ 		SetMode( currentModeIndex );
+@@ -300,9 +329,23 @@ void CMenuVidModes::SetConfig( )
+ 		Hide();
+ }
+ 
++void CMenuVidModesModel::OnActivateEntry( int line )
++{
++	if( g_pVidModesMenu )
++		g_pVidModesMenu->SetConfig();
++}
++
+ void CMenuVidModes::FinalizeChanges()
+ {
+ 	prevMode = EngFuncs::GetCvarFloat( "vid_mode" );
++#if defined(__FreeBSD__)
++	{
++		// PS5: the list is 1080p/1440p/4K, vid_mode is not used
++		int h = (int)EngFuncs::GetCvarFloat( "vid_ps5_height" );
++		if( h > 0 )
++			prevMode = h >= 2160 ? 2 : h >= 1440 ? 1 : 0;
++	}
++#endif
+ 	prevFullscreen = EngFuncs::GetCvarFloat( "fullscreen" );
+ 	prevModeX = EngFuncs::GetCvarFloat( "width" );
+ 	prevModeY = EngFuncs::GetCvarFloat( "height" );
+@@ -369,6 +412,7 @@ void CMenuVidModes::_Init( void )
+ 
+ 	banner.SetPicture( ART_BANNER );
+ 
++	g_pVidModesMenu = this;
+ 	vidList.SetRect( 360, 230, -20, 365 );
+ 	vidList.SetupColumn( 0, L( "GameUI_Resolution" ), 1.0f );
+ 	vidList.SetModel( &vidListModel );
