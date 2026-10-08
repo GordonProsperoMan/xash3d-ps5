@@ -6,3 +6,7 @@ hlsdk-portable-bshift 1cd7ae9a4e327f59994ea1fadd1e04814e1e0207
 ps5-opengl dce74910af7f4274c48d05e0ae001b3038462588 https://github.com/blackbearreloaded/ps5-opengl.git
 ps5-native-app-boilerplate 4f531c4b517f80bcb6b1267135848168d2250047 https://github.com/blackbearreloaded/ps5-native-app-boilerplate.git
 ps5-sdl 8c56053f13ca13a0c050de613706ff69eb615836 https://github.com/ps5-payload-dev/SDL.git
+cs16-client e30e27c3bd890f731ad7921d9c876d171aea4b32 https://github.com/Velaron/cs16-client.git
+PS5_Vulkan 3f3ee69607013b345d2baa6d6a37c86745649a08 https://github.com/mihawk-99/PS5_Vulkan.git
+PS5_Mesa 0b2d6d1a61d9bbf89cf8beb88a696144f67c61f8 https://github.com/mihawk-99/PS5_Mesa.git
+PS5_PayloadSDK 95c08f27386fc698f6bbe21dde3030140a41d10b https://github.com/mihawk-99/PS5_PayloadSDK.git

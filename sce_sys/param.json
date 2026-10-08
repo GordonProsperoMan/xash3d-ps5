@@ -6,11 +6,11 @@
   "applicationDrmType": "free",
   "attribute": 0,
   "attribute2": 0,
-  "attribute3": 0,
+  "attribute3": 524352,
   "conceptId": "19111",
   "contentBadgeType": 1,
   "contentId": "UP9000-PPSA19111_00-XASHPS5HLPORT001",
-  "contentVersion": "01.020.000",
+  "contentVersion": "01.030.000",
   "downloadDataSize": 256,
   "gameIntent": {
     "permittedIntents": [
@@ -22,7 +22,7 @@
   "localizedParameters": {
     "defaultLanguage": "en-US",
     "en-US": {
-      "titleName": "XashPS5 V1.2"
+      "titleName": "XashPS5 V1.3"
     }
   },
   "masterVersion": "01.00",

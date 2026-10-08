@@ -1,0 +1,8 @@
+{
+	local:
+		__wrap_*;
+		strcasestr;
+		isatty;
+		mkstemp;
+		getpwuid;
+};

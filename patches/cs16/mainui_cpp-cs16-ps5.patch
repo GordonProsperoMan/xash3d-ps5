@@ -1,8 +1,8 @@
 diff --git a/BaseMenu.h b/BaseMenu.h
-index 4d663ef..63fab94 100755
+index c037e68..e73087d 100755
 --- a/BaseMenu.h
 +++ b/BaseMenu.h
-@@ -273,6 +273,7 @@ void UI_LoadGame_Menu( void );
+@@ -280,6 +280,7 @@ void UI_LoadGame_Menu( void );
  void UI_SaveGame_Menu( void );
  void UI_SaveLoad_Menu( void );
  void UI_MultiPlayer_Menu( void );
@@ -10,14 +10,6 @@ index 4d663ef..63fab94 100755
  void UI_Options_Menu( void );
  void UI_InternetGames_Menu( void );
  void UI_LanGame_Menu( void );
-diff --git a/exports.txt b/exports.txt
-index 50217f6..f3dafcb 100644
---- a/exports.txt
-+++ b/exports.txt
-@@ -1,2 +1,3 @@
- GetMenuAPI
- GetExtAPI
-+AddTouchButtonToList
 diff --git a/menus/Debug.cpp b/menus/Debug.cpp
 new file mode 100644
 index 0000000..12bac0f
@@ -266,18 +258,42 @@ index 0ad3289..503dfa1 100644
  	int sliderAlign = invSide.size.h - side.size.h;
  
 diff --git a/menus/Main.cpp b/menus/Main.cpp
-index 4d1a382..2553089 100644
+index 06f0bab..b7ccd98 100644
 --- a/menus/Main.cpp
 +++ b/menus/Main.cpp
-@@ -73,6 +73,7 @@ private:
- 	CMenuPicButton	customGame;
+@@ -64,6 +64,7 @@ private:
+ 	CMenuPicButton	console;
+ 	CMenuPicButton	resumeGame;
+ 	CMenuPicButton	disconnect;
++	CMenuPicButton	changeTeam; // XashPS5: no free gamepad button for chooseteam
+ 	CMenuPicButton	newGame;
+ 	CMenuPicButton	hazardCourse;
+ 	CMenuPicButton	configuration;
+@@ -73,6 +74,7 @@ private:
+ 	CMenuPicButton	readme;
  	CMenuPicButton	previews;
  	CMenuPicButton	quit;
 +	CMenuPicButton	debugMenu; // XashPS5
  
  	// buttons on top right. Maybe should be drawn if fullscreen == 1?
  	CMenuBitmap	minimizeBtn;
-@@ -228,6 +229,11 @@ void CMenuMain::_Init( void )
+@@ -195,6 +197,15 @@ void CMenuMain::_Init( void )
+ 	disconnect.iFlags |= QMF_NOTIFY;
+ 	disconnect.onReleased = VoidCb( &CMenuMain::DisconnectDialogCb );
+ 
++	changeTeam.SetNameAndStatus( L( "Change team" ), L( "Choose another team" ) );
++	changeTeam.SetPicture( "gfx/shell/btn_ps5changeteam" ); // no art: drawn as text
++	changeTeam.iFlags |= QMF_NOTIFY;
++	SET_EVENT_MULTI( changeTeam.onReleased,
++	{
++		UI_CloseMenu();
++		EngFuncs::ClientCmd( false, "chooseteam\n" );
++	});
++
+ 	newGame.SetNameAndStatus( L( "GameUI_NewGame" ), L( "StringsList_189" ) );
+ 	newGame.SetPicture( PC_NEW_GAME );
+ 	newGame.iFlags |= QMF_NOTIFY;
+@@ -233,6 +244,11 @@ void CMenuMain::_Init( void )
  	previews.iFlags |= QMF_NOTIFY;
  	SET_EVENT( previews.onReleased, EngFuncs::ShellExecute( MenuStrings[ IDS_MEDIA_PREVIEWURL ], NULL, false ) );
  
@@ -289,15 +305,30 @@ index 4d1a382..2553089 100644
  	quit.SetNameAndStatus( L( "GameUI_GameMenu_Quit" ), L( "GameUI_QuitConfirmationText" ) );
  	quit.SetPicture( PC_QUIT );
  	quit.iFlags |= QMF_NOTIFY;
-@@ -283,6 +289,7 @@ void CMenuMain::_Init( void )
+@@ -288,7 +304,9 @@ void CMenuMain::_Init( void )
  
  	AddItem( banner );
  	AddItem( console );
-+	AddItem( debugMenu ); // XashPS5: focus order follows AddItem order, keep it with its on-screen position
++	AddItem( debugMenu ); // focus order = on-screen order (just under console)
  	AddItem( disconnect );
++	AddItem( changeTeam );
  	AddItem( resumeGame );
  	AddItem( newGame );
-@@ -366,6 +373,9 @@ void CMenuMain::VidInit( bool connected )
+ 
+@@ -368,6 +386,12 @@ void CMenuMain::VidInit( bool connected )
+ 		resumeGame.SetCoord( hoffset, yoffset );
+ 		yoffset -= ygap;
+ 
++		if( !single )
++		{
++			changeTeam.SetCoord( hoffset, yoffset );
++			yoffset -= ygap;
++		}
++
+ 		if( !single )
+ 		{
+ 			disconnect.SetCoord( hoffset, yoffset );
+@@ -375,12 +399,16 @@ void CMenuMain::VidInit( bool connected )
  		}
  	}
  
@@ -307,8 +338,15 @@ index 4d1a382..2553089 100644
  	console.SetCoord( hoffset, yoffset );
  	yoffset -= ygap;
  
+ 	// now figure out what's visible
+ 	resumeGame.SetVisibility( connected );
+ 	disconnect.SetVisibility( connected && !single );
++	changeTeam.SetVisibility( connected && !single );
+ 
+ 	// they exist in the original and can be mistakenly clicked
+ 	newGame.SetVisibility( false );
 diff --git a/menus/VideoModes.cpp b/menus/VideoModes.cpp
-index 28f1ef6..f37dbb5 100644
+index bb96ec8..8d3c987 100644
 --- a/menus/VideoModes.cpp
 +++ b/menus/VideoModes.cpp
 @@ -35,10 +35,14 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
@@ -326,15 +364,15 @@ index 28f1ef6..f37dbb5 100644
  	int GetRows() const override
  	{
  		return m_szModes.Count();
-@@ -115,6 +119,7 @@ public:
- 	bool IsRendererChanged();
+@@ -114,6 +118,7 @@ public:
+ 	void WriteRendererConfig();
  
  	CMenuCheckBox	vsync;
 +	CMenuCheckBox	hz120; // XashPS5: 119.88 Hz output (Zink build only)
  
  	CMenuTable	vidList;
  	CMenuVidModesModel vidListModel;
-@@ -138,6 +143,15 @@ void CMenuVidModesModel::Update()
+@@ -136,6 +141,15 @@ void CMenuVidModesModel::Update()
  {
  	m_szModes.Purge();
  
@@ -350,7 +388,7 @@ index 28f1ef6..f37dbb5 100644
  	for( int i = 0; ; i++ )
  	{
  		const char *mode = EngFuncs::GetModeString( i );
-@@ -220,6 +234,13 @@ void CMenuVidModes::GetConfig()
+@@ -207,6 +221,13 @@ void CMenuVidModes::GetConfig()
  	fullscreen = bound( 0, fullscreen, 2 ); // windowed, fullscreen, borderless
  
  	float vid_mode = EngFuncs::GetCvarFloat( "vid_mode" );
@@ -364,7 +402,7 @@ index 28f1ef6..f37dbb5 100644
  	vid_mode = bound( 0, vid_mode, vidListModel.GetRows( ));
  
  	windowMode.SetCurrentValue( fullscreen );
-@@ -283,6 +304,22 @@ void CMenuVidModes::SetConfig( )
+@@ -269,6 +290,22 @@ void CMenuVidModes::SetConfig( )
  	if( isWindowedModeChanged )
  		EngFuncs::CvarSetValue( "fullscreen", currentWindowModeIndex );
  
@@ -387,7 +425,7 @@ index 28f1ef6..f37dbb5 100644
  	if( isVidModeChanged )
  	{
  		SetMode( currentModeIndex );
-@@ -300,9 +337,23 @@ void CMenuVidModes::SetConfig( )
+@@ -280,9 +317,23 @@ void CMenuVidModes::SetConfig( )
  		Hide();
  }
  
@@ -411,7 +449,7 @@ index 28f1ef6..f37dbb5 100644
  	prevFullscreen = EngFuncs::GetCvarFloat( "fullscreen" );
  	prevModeX = EngFuncs::GetCvarFloat( "width" );
  	prevModeY = EngFuncs::GetCvarFloat( "height" );
-@@ -369,6 +420,7 @@ void CMenuVidModes::_Init( void )
+@@ -349,6 +400,7 @@ void CMenuVidModes::_Init( void )
  
  	banner.SetPicture( ART_BANNER );
  
@@ -419,7 +457,7 @@ index 28f1ef6..f37dbb5 100644
  	vidList.SetRect( 360, 230, -20, 365 );
  	vidList.SetupColumn( 0, L( "GameUI_Resolution" ), 1.0f );
  	vidList.SetModel( &vidListModel );
-@@ -377,6 +429,10 @@ void CMenuVidModes::_Init( void )
+@@ -357,6 +409,10 @@ void CMenuVidModes::_Init( void )
  	vsync.SetCoord( 360, 670 );
  	vsync.LinkCvar( "gl_vsync" );
  
@@ -430,7 +468,7 @@ index 28f1ef6..f37dbb5 100644
  	testModeMsgBox.SetMessage( testModeMsg );
  	testModeMsgBox.onPositive = VoidCb( &CMenuVidModes::FinalizeChanges );
  	testModeMsgBox.onNegative = VoidCb( &CMenuVidModes::RevertChanges );
-@@ -412,6 +468,9 @@ void CMenuVidModes::_Init( void )
+@@ -389,6 +445,9 @@ void CMenuVidModes::_Init( void )
  	AddItem( renderers );
  	AddItem( windowMode );
  	AddItem( vsync );
@@ -440,7 +478,7 @@ index 28f1ef6..f37dbb5 100644
  	AddItem( vidList );
  
  	renderers.LinkCvar( "r_refdll", CMenuEditable::CVAR_STRING );
-@@ -420,6 +479,8 @@ void CMenuVidModes::_Init( void )
+@@ -397,6 +456,8 @@ void CMenuVidModes::_Init( void )
  void CMenuVidModes::Reload()
  {
  	GetConfig();

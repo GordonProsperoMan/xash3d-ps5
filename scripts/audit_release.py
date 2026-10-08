@@ -16,6 +16,7 @@ ALLOW = [
     'sce_sys/param.json', 'sce_sys/icon0.png', 'sce_sys/pic0.dds',
     'sce_sys/pic1.dds', 'sce_sys/snd0.at9',
     '*/userconfig.cfg', '*/autoexec.cfg', '*/LISEZMOI_README.txt',
+    # cstrike/extras.pk3 (cs16-client data) stays out: it contains game sounds and maps
     'valve/extras.pk3',
 ]
 GAME_DIRS = {'valve', 'gearbox', 'bshift', 'cstrike'}

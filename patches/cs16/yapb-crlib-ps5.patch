@@ -1,0 +1,22 @@
+diff --git a/crlib/cpuflags.h b/crlib/cpuflags.h
+index 9a5ca69..da29d6c 100644
+--- a/crlib/cpuflags.h
++++ b/crlib/cpuflags.h
+@@ -45,7 +45,7 @@ private:
+ 
+ #if defined(CR_WINDOWS) && defined(CR_CXX_MSVC)
+    __cpuidex (reinterpret_cast <int32_t *> (data), 1, 0);
+-#elif !defined(CR_EMSCRIPTEN)
++#elif !defined(CR_EMSCRIPTEN) && !defined(__FreeBSD__)
+       __get_cpuid (0x1, &data[eax], &data[ebx], &data[ecx], &data[edx]);
+ #endif
+       sse3 = !!(data[ecx] & CpuCap::SSE3);
+@@ -56,7 +56,7 @@ private:
+ 
+ #if defined(CR_WINDOWS) && defined(CR_CXX_MSVC)
+       __cpuidex (reinterpret_cast <int32_t *> (data), 7, 0);
+-#elif !defined(CR_EMSCRIPTEN)
++#elif !defined(CR_EMSCRIPTEN) && !defined(__FreeBSD__)
+       __get_cpuid (0x7, &data[eax], &data[ebx], &data[ecx], &data[edx]);
+ #endif
+       avx2 = !!(data[ebx] & CpuCap::AVX2);

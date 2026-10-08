@@ -1,0 +1,880 @@
+diff --git a/include/kopper_interface.h b/include/kopper_interface.h
+index 7e30277..a7b74d4 100644
+--- a/include/kopper_interface.h
++++ b/include/kopper_interface.h
+@@ -90,7 +90,7 @@ struct kopper_vk_surface_create_storage {
+    /* First two fields are copied from VkBaseOutStructure for easily access shared properties */
+    VkStructureType sType;
+    struct VkBaseOutStructure *pNext;
+-   intptr_t padding[3];
++   intptr_t padding[8]; /* PS5: VkDisplaySurfaceCreateInfoKHR (56 bytes) */
+ };
+ 
+ struct kopper_loader_info {
+diff --git a/src/gallium/drivers/zink/meson.build b/src/gallium/drivers/zink/meson.build
+index 073f0a4..d0e2b6e 100644
+--- a/src/gallium/drivers/zink/meson.build
++++ b/src/gallium/drivers/zink/meson.build
+@@ -54,7 +54,7 @@ zink_nir_algebraic_c = custom_target(
+   depend_files : nir_algebraic_depends,
+ )
+ 
+-zink_c_args = []
++zink_c_args = host_machine.system() == 'freebsd' and get_option('radv-winsys') == 'ps5' ? ['-DZINK_PS5_STATIC_RADV'] : []
+ inc_zink_vk = []
+ zink_link_args = []
+ 
+diff --git a/src/gallium/drivers/zink/zink_instance.py b/src/gallium/drivers/zink/zink_instance.py
+index 234d0ec..332e881 100755
+--- a/src/gallium/drivers/zink/zink_instance.py
++++ b/src/gallium/drivers/zink/zink_instance.py
+@@ -48,6 +48,7 @@ EXTENSIONS = [
+     Extension("VK_KHR_wayland_surface"),
+     Extension("VK_KHR_xcb_surface"),
+     Extension("VK_KHR_win32_surface"),
++    Extension("VK_KHR_display"),
+     Extension("VK_EXT_swapchain_colorspace"),
+ ]
+ 
+diff --git a/src/gallium/drivers/zink/zink_kopper.c b/src/gallium/drivers/zink/zink_kopper.c
+index 950a89b..9835f0e 100644
+--- a/src/gallium/drivers/zink/zink_kopper.c
++++ b/src/gallium/drivers/zink/zink_kopper.c
+@@ -80,6 +80,9 @@ init_dt_type(struct kopper_displaytarget *cdt)
+       cdt->type = KOPPER_WIN32;
+       break;
+ #endif
++   case VK_STRUCTURE_TYPE_DISPLAY_SURFACE_CREATE_INFO_KHR:
++      cdt->type = KOPPER_PS5;
++      break;
+    default:
+       UNREACHABLE("unsupported!");
+    }
+@@ -119,10 +122,58 @@ kopper_CreateSurface(struct zink_screen *screen, struct kopper_displaytarget *cd
+       break;
+    }
+ #endif
++   case VK_STRUCTURE_TYPE_DISPLAY_SURFACE_CREATE_INFO_KHR: {
++      /* PS5: one VideoOut display; the frontend passes the extent, we pick
++       * the display's first mode here (the EGL layer has no Vulkan handles) */
++      VkDisplaySurfaceCreateInfoKHR *dsci = (VkDisplaySurfaceCreateInfoKHR *)&cdt->info.bos;
++      PFN_vkGetPhysicalDeviceDisplayPropertiesKHR get_displays =
++         (PFN_vkGetPhysicalDeviceDisplayPropertiesKHR)screen->vk_GetInstanceProcAddr(screen->instance, "vkGetPhysicalDeviceDisplayPropertiesKHR");
++      PFN_vkGetDisplayModePropertiesKHR get_modes =
++         (PFN_vkGetDisplayModePropertiesKHR)screen->vk_GetInstanceProcAddr(screen->instance, "vkGetDisplayModePropertiesKHR");
++      PFN_vkCreateDisplayPlaneSurfaceKHR create =
++         (PFN_vkCreateDisplayPlaneSurfaceKHR)screen->vk_GetInstanceProcAddr(screen->instance, "vkCreateDisplayPlaneSurfaceKHR");
++      VkDisplayPropertiesKHR display;
++      VkDisplayModePropertiesKHR modes[8];
++      uint32_t count = 1;
++      if (!get_displays || !get_modes || !create) {
++         mesa_loge("zink/ps5: VK_KHR_display entry points missing");
++         error = VK_ERROR_EXTENSION_NOT_PRESENT;
++         break;
++      }
++      error = get_displays(screen->pdev, &count, &display);
++      if ((error != VK_SUCCESS && error != VK_INCOMPLETE) || !count) {
++         mesa_loge("zink/ps5: no display (%d)", error);
++         error = VK_ERROR_INITIALIZATION_FAILED;
++         break;
++      }
++      count = 8;
++      error = get_modes(screen->pdev, display.display, &count, modes);
++      if ((error != VK_SUCCESS && error != VK_INCOMPLETE) || !count) {
++         mesa_loge("zink/ps5: no display mode (%d)", error);
++         error = VK_ERROR_INITIALIZATION_FAILED;
++         break;
++      }
++      /* the fastest mode of the swapchain's size: VideoOut lists its
++       * 119.88 Hz mode only when the output was opened at high frame rate */
++      dsci->displayMode = modes[0].displayMode;
++      uint32_t best_refresh = 0;
++      for (uint32_t i = 0; i < count; i++)
++         if (modes[i].parameters.visibleRegion.width == dsci->imageExtent.width &&
++             modes[i].parameters.visibleRegion.height == dsci->imageExtent.height &&
++             modes[i].parameters.refreshRate > best_refresh) {
++            dsci->displayMode = modes[i].displayMode;
++            best_refresh = modes[i].parameters.refreshRate;
++         }
++      mesa_logi("zink/ps5: display %s, %u mode(s), surface %ux%u, %u mHz", display.displayName ? display.displayName : "?",
++                count, dsci->imageExtent.width, dsci->imageExtent.height, best_refresh);
++      error = create(screen->instance, dsci, NULL, &surface);
++      break;
++   }
+    default:
+       UNREACHABLE("unsupported!");
+    }
+    if (error != VK_SUCCESS) {
++      mesa_loge("zink: surface creation failed (%d)", error);
+       return VK_NULL_HANDLE;
+    }
+ 
+@@ -235,6 +286,9 @@ find_dt_entry(struct zink_screen *screen, const struct kopper_displaytarget *cdt
+       break;
+    }
+ #endif
++   case KOPPER_PS5:
++      he = _mesa_hash_table_search(&screen->dts, (void *)(uintptr_t)1);
++      break;
+    default:
+       UNREACHABLE("unsupported!");
+    }
+@@ -313,6 +367,7 @@ kopper_CreateSwapchain(struct zink_screen *screen, struct kopper_displaytarget *
+    switch (cdt->type) {
+    case KOPPER_X11:
+    case KOPPER_WIN32:
++   case KOPPER_PS5:
+       /* With Xcb, minImageExtent, maxImageExtent, and currentExtent must always equal the window size.
+        * ...
+        * Due to above restrictions, it is only possible to create a new swapchain on this
+@@ -444,6 +499,7 @@ zink_kopper_displaytarget_create(struct zink_screen *screen, unsigned tex_usage,
+             break;
+          case KOPPER_WAYLAND:
+          case KOPPER_WIN32:
++         case KOPPER_PS5:
+             _mesa_hash_table_init(&screen->dts, screen, _mesa_hash_pointer, _mesa_key_pointer_equal);
+             break;
+          default:
+@@ -516,6 +572,9 @@ zink_kopper_displaytarget_create(struct zink_screen *screen, unsigned tex_usage,
+       break;
+    }
+ #endif
++   case KOPPER_PS5:
++      _mesa_hash_table_insert(&screen->dts, (void *)(uintptr_t)1, cdt);
++      break;
+    default:
+       UNREACHABLE("unsupported!");
+    }
+diff --git a/src/gallium/drivers/zink/zink_kopper.h b/src/gallium/drivers/zink/zink_kopper.h
+index d1971ec..de65f76 100644
+--- a/src/gallium/drivers/zink/zink_kopper.h
++++ b/src/gallium/drivers/zink/zink_kopper.h
+@@ -74,7 +74,8 @@ struct kopper_swapchain {
+ enum kopper_type {
+    KOPPER_X11,
+    KOPPER_WAYLAND,
+-   KOPPER_WIN32
++   KOPPER_WIN32,
++   KOPPER_PS5 /* VK_KHR_display on VideoOut (PS5_Vulkan RADV) */
+ };
+ 
+ struct kopper_displaytarget
+diff --git a/src/gallium/drivers/zink/zink_screen.c b/src/gallium/drivers/zink/zink_screen.c
+index c11c6a2..5247749 100644
+--- a/src/gallium/drivers/zink/zink_screen.c
++++ b/src/gallium/drivers/zink/zink_screen.c
+@@ -62,6 +62,11 @@
+ #endif
+ #endif
+ 
++#ifdef ZINK_PS5_STATIC_RADV
++VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_icdGetInstanceProcAddr(VkInstance instance, const char *name);
++VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_common_GetDeviceProcAddr(VkDevice device, const char *name);
++#endif
++
+ static int num_screens = 0;
+ bool zink_tracing = false;
+ 
+@@ -3422,6 +3427,13 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
+ 
+    u_trace_state_init();
+ 
++#ifdef ZINK_PS5_STATIC_RADV
++   /* PS5: no dlopen; RADV is linked into the title, entered through its ICD
++    * interface (as PS5_Vulkan's radv_smoke does) */
++   screen->loader_lib = NULL;
++   screen->vk_GetInstanceProcAddr = vk_icdGetInstanceProcAddr;
++   screen->vk_GetDeviceProcAddr = vk_common_GetDeviceProcAddr;
++#else
+    screen->loader_lib = util_dl_open(VK_LIBNAME);
+    if (!screen->loader_lib) {
+       if (!screen->driver_name_is_inferred)
+@@ -3431,6 +3443,7 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
+ 
+    screen->vk_GetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)util_dl_get_proc_address(screen->loader_lib, "vkGetInstanceProcAddr");
+    screen->vk_GetDeviceProcAddr = (PFN_vkGetDeviceProcAddr)util_dl_get_proc_address(screen->loader_lib, "vkGetDeviceProcAddr");
++#endif
+    if (!screen->vk_GetInstanceProcAddr ||
+        !screen->vk_GetDeviceProcAddr) {
+       if (!screen->driver_name_is_inferred)
+diff --git a/src/gallium/frontends/ps5egl/meson.build b/src/gallium/frontends/ps5egl/meson.build
+new file mode 100644
+index 0000000..ad09fda
+--- /dev/null
++++ b/src/gallium/frontends/ps5egl/meson.build
+@@ -0,0 +1,9 @@
++# PS5 experimental: EGL frontend for Zink on RADV (Xash3D-PS5 Zink branch)
++libps5zinkegl = static_library(
++  'ps5zinkegl',
++  files('ps5_zink_egl.c'),
++  include_directories : [inc_include, inc_src, inc_mesa, inc_gallium, inc_gallium_aux,
++                         inc_gallium_drivers, inc_vulkan_util],
++  dependencies : [idep_mesautil, idep_vulkan_util_headers, idep_nir_headers, idep_mesautil],
++  c_args : ['-DGALLIUM_ZINK'],
++)
+diff --git a/src/gallium/frontends/ps5egl/ps5_zink_egl.c b/src/gallium/frontends/ps5egl/ps5_zink_egl.c
+new file mode 100644
+index 0000000..2fd2645
+--- /dev/null
++++ b/src/gallium/frontends/ps5egl/ps5_zink_egl.c
+@@ -0,0 +1,621 @@
++// PS5 Zink EGL - minimal EGL 1.4 frontend for Mesa's Zink (OpenGL on Vulkan)
++// running on RADV (mihawk-99/PS5_Vulkan) on the PlayStation 5.
++// Experimental Xash3D-PS5 branch. SPDX-License-Identifier: MIT
++//
++// Covers the EGL subset the ps5-opengl SDL2 "G19" video driver uses, so SDL2
++// and the application are unchanged: one display, one window surface (the TV,
++// a VK_KHR_display swapchain created by Zink's kopper layer), OpenGL contexts.
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <EGL/egl.h>
++#include <EGL/eglext.h>
++#include <vulkan/vulkan_core.h>
++
++#include "frontend/api.h"
++#include "kopper_interface.h"
++#include "glapi/glapi/glapi.h"
++#include "main/context.h"
++#include "main/glthread.h"
++#include "pipe/p_screen.h"
++#include "pipe/p_context.h"
++#include "pipe/p_state.h"
++#include "state_tracker/st_context.h"
++#include "util/u_atomic.h"
++#include "util/u_inlines.h"
++#include "util/box.h"
++#include "util/simple_mtx.h"
++#include "zink/zink_public.h"
++#include "zink/zink_kopper.h"
++
++#define PZ_CTX_MAGIC 0x505a4358u
++#define PZ_SURF_MAGIC 0x505a5346u
++
++struct pz_display {
++   struct pipe_frontend_screen frontend;
++   struct pipe_screen *screen;
++   bool initialized;
++   unsigned next_drawable_id;
++   int width, height;
++};
++
++struct pz_surface {
++   struct pipe_frontend_drawable drawable; /* must be first */
++   uint32_t magic;
++   struct st_visual visual;
++   struct kopper_loader_info info;
++   struct pipe_resource *textures[ST_ATTACHMENT_COUNT];
++   /* VideoOut swapchain image: always 3840x2160 (RADV's VK_KHR_display has a
++    * single 4K mode); the GL back buffer is width x height and is scaled into
++    * it at swap time */
++   struct pipe_resource *display;
++   int width, height;
++   int swap_interval;
++   bool current;
++};
++
++struct pz_context {
++   uint32_t magic;
++   struct st_context *st;
++   bool current;
++};
++
++static struct pz_display pz;
++static struct st_visual pz_visual;
++static const int pz_config_token = 1;
++static _Thread_local EGLint pz_error = EGL_SUCCESS;
++static _Thread_local struct pz_context *pz_cur_ctx;
++static _Thread_local struct pz_surface *pz_cur_draw;
++static struct pz_surface *pz_window;
++static simple_mtx_t pz_mutex = SIMPLE_MTX_INITIALIZER;
++
++int sceSystemServiceHideSplashScreen(void);
++int sceKernelDebugOutText(int channel, const char *text);
++int ps5_klog_capture_stderr(const char *prefix);
++#include <stdarg.h>
++/* title stdout does not reach klog: route the frontend's messages there */
++static void pz_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
++static void pz_log(const char *fmt, ...)
++{
++   char line[512];
++   va_list ap;
++   va_start(ap, fmt);
++   vsnprintf(line, sizeof(line), fmt, ap);
++   va_end(ap);
++   sceKernelDebugOutText(0, line);
++}
++EGLAPI EGLBoolean EGLAPIENTRY eglSetDisplayModePS5(EGLDisplay d, EGLint width, EGLint height);
++
++#define PZ_LOCK() simple_mtx_lock(&pz_mutex)
++#define PZ_UNLOCK() simple_mtx_unlock(&pz_mutex)
++#define PZ_FAIL(err, ret) do { pz_error = (err); PZ_UNLOCK(); return (ret); } while (0)
++
++static bool pz_valid_display(EGLDisplay d) { return d == (EGLDisplay)&pz; }
++
++/* ------------------------------------------------------------- st callbacks */
++
++static int
++pz_get_param(struct pipe_frontend_screen *fs, enum st_manager_param param)
++{
++   (void)fs; (void)param;
++   return 0;
++}
++
++static bool
++pz_flush_front(struct st_context *st, struct pipe_frontend_drawable *d, enum st_attachment_type a)
++{
++   (void)st; (void)d; (void)a;
++   return true;
++}
++
++static bool
++pz_validate(struct st_context *st, struct pipe_frontend_drawable *drawable,
++            const enum st_attachment_type *statts, unsigned count,
++            struct pipe_resource **out, struct pipe_resource **resolve)
++{
++   struct pz_surface *s = (struct pz_surface *)drawable;
++   struct pipe_screen *screen = pz.screen;
++   (void)st;
++   if (resolve)
++      *resolve = NULL;
++
++   for (unsigned i = 0; i < count; i++) {
++      enum st_attachment_type a = statts[i];
++      if (!s->textures[a]) {
++         struct pipe_resource templ;
++         memset(&templ, 0, sizeof(templ));
++         templ.target = PIPE_TEXTURE_2D;
++         templ.width0 = s->width;
++         templ.height0 = s->height;
++         templ.depth0 = 1;
++         templ.array_size = 1;
++         if (a == ST_ATTACHMENT_DEPTH_STENCIL) {
++            templ.format = s->visual.depth_stencil_format;
++            templ.bind = PIPE_BIND_DEPTH_STENCIL;
++            s->textures[a] = screen->resource_create(screen, &templ);
++         } else if (a == ST_ATTACHMENT_BACK_LEFT && !s->display) {
++            struct pipe_resource dt = templ;
++            dt.width0 = 3840;
++            dt.height0 = 2160;
++            dt.format = s->visual.color_format;
++            dt.bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_DISPLAY_TARGET;
++            s->display = screen->resource_create_drawable(screen, &dt, &s->info);
++            if (!s->display) {
++               pz_log("[pz-egl] swapchain creation failed\n");
++               return false;
++            }
++            pz_log("[pz-egl] swapchain 3840x2160, GL back buffer %dx%d\n", s->width, s->height);
++            templ.format = s->visual.color_format;
++            templ.bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW;
++            s->textures[a] = screen->resource_create(screen, &templ);
++         } else {
++            templ.format = s->visual.color_format;
++            templ.bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW;
++            s->textures[a] = screen->resource_create(screen, &templ);
++         }
++         if (!s->textures[a]) {
++            pz_log("[pz-egl] attachment %d creation failed\n", a);
++            return false;
++         }
++      }
++      pipe_resource_reference(&out[i], s->textures[a]);
++   }
++   return true;
++}
++
++static bool
++pz_flush_swapbuffers(struct st_context *st, struct pipe_frontend_drawable *d)
++{
++   (void)st; (void)d;
++   return true;
++}
++
++/* ------------------------------------------------------------------ display */
++
++EGLAPI EGLDisplay EGLAPIENTRY
++eglGetDisplay(EGLNativeDisplayType id)
++{
++   (void)id;
++   return (EGLDisplay)&pz;
++}
++
++EGLAPI EGLBoolean EGLAPIENTRY
++eglInitialize(EGLDisplay d, EGLint *major, EGLint *minor)
++{
++   PZ_LOCK();
++   if (!pz_valid_display(d))
++      PZ_FAIL(EGL_BAD_DISPLAY, EGL_FALSE);
++   if (!pz.initialized) {
++      static bool klog_stderr;
++      if (!klog_stderr) {
++         /* Mesa/RADV/Zink report on stderr (mesa_loge): send it to klog */
++         ps5_klog_capture_stderr("[mesa] ");
++         klog_stderr = true;
++      }
++      pz_log("[pz-egl] creating zink screen on RADV\n");
++      pz.screen = zink_create_screen(NULL, NULL);
++      if (!pz.screen) {
++         pz_log("[pz-egl] zink_create_screen failed\n");
++         PZ_FAIL(EGL_NOT_INITIALIZED, EGL_FALSE);
++      }
++      pz_log("[pz-egl] screen: %s / %s\n", pz.screen->get_name(pz.screen),
++             pz.screen->get_vendor(pz.screen));
++      memset(&pz.frontend, 0, sizeof(pz.frontend));
++      pz.frontend.screen = pz.screen;
++      pz.frontend.get_param = pz_get_param;
++      pz.next_drawable_id = 1;
++      if (!pz.width) {
++         const char *res = getenv("SDL_PS5_RESOLUTION");
++         int h = res ? atoi(res) : 1080;
++         pz.height = h == 2160 ? 2160 : h == 1440 ? 1440 : 1080;
++         pz.width = pz.height == 2160 ? 3840 : pz.height == 1440 ? 2560 : 1920;
++      }
++      memset(&pz_visual, 0, sizeof(pz_visual));
++      pz_visual.buffer_mask = ST_ATTACHMENT_BACK_LEFT_MASK | ST_ATTACHMENT_DEPTH_STENCIL_MASK;
++      pz_visual.color_format = PIPE_FORMAT_B8G8R8A8_UNORM;
++      pz_visual.depth_stencil_format = PIPE_FORMAT_Z24_UNORM_S8_UINT;
++      if (!pz.screen->is_format_supported(pz.screen, pz_visual.depth_stencil_format,
++                                          PIPE_TEXTURE_2D, 0, 0, PIPE_BIND_DEPTH_STENCIL))
++         pz_visual.depth_stencil_format = PIPE_FORMAT_Z32_FLOAT_S8X24_UINT;
++      pz_visual.accum_format = PIPE_FORMAT_NONE;
++      pz_visual.samples = 0;
++      pz.initialized = true;
++   }
++   if (major) *major = 1;
++   if (minor) *minor = 4;
++   PZ_UNLOCK();
++   return EGL_TRUE;
++}
++
++/* Same contract as ps5-opengl: choose the scanout size before eglInitialize. */
++EGLAPI EGLBoolean EGLAPIENTRY
++eglSetDisplayModePS5(EGLDisplay d, EGLint width, EGLint height)
++{
++   if (!pz_valid_display(d) || pz.initialized)
++      return EGL_FALSE;
++   if (!((width == 1920 && height == 1080) || (width == 2560 && height == 1440) ||
++         (width == 3840 && height == 2160)))
++      return EGL_FALSE;
++   pz.width = width;
++   pz.height = height;
++   return EGL_TRUE;
++}
++
++EGLAPI EGLBoolean EGLAPIENTRY
++eglTerminate(EGLDisplay d)
++{
++   PZ_LOCK();
++   if (!pz_valid_display(d))
++      PZ_FAIL(EGL_BAD_DISPLAY, EGL_FALSE);
++   if (pz.initialized) {
++      st_screen_destroy(&pz.frontend);
++      pz.screen->destroy(pz.screen);
++      pz.screen = NULL;
++      pz.initialized = false;
++   }
++   PZ_UNLOCK();
++   return EGL_TRUE;
++}
++
++EGLAPI EGLint EGLAPIENTRY
++eglGetError(void)
++{
++   EGLint e = pz_error;
++   pz_error = EGL_SUCCESS;
++   return e;
++}
++
++EGLAPI const char *EGLAPIENTRY
++eglQueryString(EGLDisplay d, EGLint name)
++{
++   (void)d;
++   switch (name) {
++   case EGL_VENDOR: return "Mesa Zink on RADV (PS5 experimental)";
++   case EGL_VERSION: return "1.4";
++   case EGL_EXTENSIONS: return "EGL_KHR_create_context";
++   case EGL_CLIENT_APIS: return "OpenGL";
++   default: pz_error = EGL_BAD_PARAMETER; return NULL;
++   }
++}
++
++EGLAPI EGLBoolean EGLAPIENTRY
++eglChooseConfig(EGLDisplay d, const EGLint *attrs, EGLConfig *configs, EGLint size, EGLint *num)
++{
++   (void)attrs;
++   if (!pz_valid_display(d)) { pz_error = EGL_BAD_DISPLAY; return EGL_FALSE; }
++   if (!num) { pz_error = EGL_BAD_PARAMETER; return EGL_FALSE; }
++   *num = 1;
++   if (configs && size > 0)
++      configs[0] = (EGLConfig)&pz_config_token;
++   return EGL_TRUE;
++}
++
++EGLAPI EGLBoolean EGLAPIENTRY
++eglGetConfigs(EGLDisplay d, EGLConfig *configs, EGLint size, EGLint *num)
++{
++   return eglChooseConfig(d, NULL, configs, size, num);
++}
++
++EGLAPI EGLBoolean EGLAPIENTRY
++eglGetConfigAttrib(EGLDisplay d, EGLConfig c, EGLint attr, EGLint *value)
++{
++   (void)d; (void)c;
++   if (!value) return EGL_FALSE;
++   switch (attr) {
++   case EGL_RED_SIZE: case EGL_GREEN_SIZE: case EGL_BLUE_SIZE: case EGL_ALPHA_SIZE: *value = 8; break;
++   case EGL_BUFFER_SIZE: *value = 32; break;
++   case EGL_DEPTH_SIZE: *value = 24; break;
++   case EGL_STENCIL_SIZE: *value = 8; break;
++   case EGL_CONFIG_ID: *value = 1; break;
++   case EGL_SURFACE_TYPE: *value = EGL_WINDOW_BIT; break;
++   case EGL_RENDERABLE_TYPE: case EGL_CONFORMANT: *value = EGL_OPENGL_BIT; break;
++   default: *value = 0; break;
++   }
++   return EGL_TRUE;
++}
++
++EGLAPI EGLBoolean EGLAPIENTRY
++eglBindAPI(EGLenum api)
++{
++   if (api != EGL_OPENGL_API) { pz_error = EGL_BAD_PARAMETER; return EGL_FALSE; }
++   return EGL_TRUE;
++}
++
++EGLAPI EGLenum EGLAPIENTRY eglQueryAPI(void) { return EGL_OPENGL_API; }
++
++/* ------------------------------------------------------------------ surface */
++
++EGLAPI EGLSurface EGLAPIENTRY
++eglCreateWindowSurface(EGLDisplay d, EGLConfig c, EGLNativeWindowType w, const EGLint *attrs)
++{
++   (void)c; (void)w; (void)attrs;
++   PZ_LOCK();
++   if (!pz_valid_display(d) || !pz.initialized)
++      PZ_FAIL(EGL_BAD_DISPLAY, EGL_NO_SURFACE);
++   if (pz_window)
++      PZ_FAIL(EGL_BAD_ALLOC, EGL_NO_SURFACE);
++   pz_log("[pz-egl] hide-splash=%08x\n", (unsigned)sceSystemServiceHideSplashScreen());
++   struct pz_surface *s = calloc(1, sizeof(*s));
++   if (!s)
++      PZ_FAIL(EGL_BAD_ALLOC, EGL_NO_SURFACE);
++   s->magic = PZ_SURF_MAGIC;
++   s->width = pz.width;
++   s->height = pz.height;
++   s->swap_interval = 1;
++   s->visual = pz_visual;
++   VkDisplaySurfaceCreateInfoKHR *dsci = (VkDisplaySurfaceCreateInfoKHR *)&s->info.bos;
++   dsci->sType = VK_STRUCTURE_TYPE_DISPLAY_SURFACE_CREATE_INFO_KHR;
++   dsci->pNext = NULL;
++   dsci->planeIndex = 0;
++   dsci->planeStackIndex = 0;
++   dsci->transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
++   dsci->globalAlpha = 1.0f;
++   dsci->alphaMode = VK_DISPLAY_PLANE_ALPHA_OPAQUE_BIT_KHR;
++   dsci->imageExtent.width = 3840;
++   dsci->imageExtent.height = 2160;
++   s->info.has_alpha = false;
++   s->info.present_opaque = true;
++   s->info.initial_swap_interval = 1;
++   s->drawable.stamp = 1;
++   s->drawable.ID = pz.next_drawable_id++;
++   s->drawable.fscreen = &pz.frontend;
++   s->drawable.visual = &s->visual;
++   s->drawable.flush_front = pz_flush_front;
++   s->drawable.validate = pz_validate;
++   s->drawable.flush_swapbuffers = pz_flush_swapbuffers;
++   pz_window = s;
++   pz_log("[pz-egl] window surface %dx%d\n", s->width, s->height);
++   PZ_UNLOCK();
++   return (EGLSurface)s;
++}
++
++static struct pz_surface *
++pz_surface(EGLSurface h)
++{
++   struct pz_surface *s = (struct pz_surface *)h;
++   return s && s->magic == PZ_SURF_MAGIC ? s : NULL;
++}
++
++EGLAPI EGLBoolean EGLAPIENTRY
++eglQuerySurface(EGLDisplay d, EGLSurface h, EGLint attr, EGLint *value)
++{
++   struct pz_surface *s = pz_surface(h);
++   (void)d;
++   if (!s || !value) { pz_error = EGL_BAD_SURFACE; return EGL_FALSE; }
++   switch (attr) {
++   case EGL_WIDTH: *value = s->width; break;
++   case EGL_HEIGHT: *value = s->height; break;
++   case EGL_CONFIG_ID: *value = 1; break;
++   case EGL_RENDER_BUFFER: *value = EGL_BACK_BUFFER; break;
++   case EGL_SWAP_BEHAVIOR: *value = EGL_BUFFER_DESTROYED; break;
++   default: pz_error = EGL_BAD_ATTRIBUTE; return EGL_FALSE;
++   }
++   return EGL_TRUE;
++}
++
++EGLAPI EGLBoolean EGLAPIENTRY
++eglDestroySurface(EGLDisplay d, EGLSurface h)
++{
++   struct pz_surface *s = pz_surface(h);
++   (void)d;
++   PZ_LOCK();
++   if (!s)
++      PZ_FAIL(EGL_BAD_SURFACE, EGL_FALSE);
++   if (s->current)
++      PZ_FAIL(EGL_BAD_ACCESS, EGL_FALSE);
++   st_api_destroy_drawable(&s->drawable);
++   for (unsigned i = 0; i < ST_ATTACHMENT_COUNT; i++)
++      pipe_resource_reference(&s->textures[i], NULL);
++   pipe_resource_reference(&s->display, NULL);
++   s->magic = 0;
++   if (pz_window == s)
++      pz_window = NULL;
++   free(s);
++   PZ_UNLOCK();
++   return EGL_TRUE;
++}
++
++/* ------------------------------------------------------------------ context */
++
++static struct pz_context *
++pz_context(EGLContext h)
++{
++   struct pz_context *c = (struct pz_context *)h;
++   return c && c->magic == PZ_CTX_MAGIC ? c : NULL;
++}
++
++EGLAPI EGLContext EGLAPIENTRY
++eglCreateContext(EGLDisplay d, EGLConfig c, EGLContext share, const EGLint *attrs)
++{
++   struct st_context_attribs attribs;
++   enum st_context_error err = ST_CONTEXT_SUCCESS;
++   int core = 0, compat = 0, es1 = 0, es2 = 0;
++   int req_major = 0, req_minor = 0;
++   EGLint profile = 0;
++   (void)c;
++
++   PZ_LOCK();
++   if (!pz_valid_display(d) || !pz.initialized)
++      PZ_FAIL(EGL_BAD_DISPLAY, EGL_NO_CONTEXT);
++   while (attrs && *attrs != EGL_NONE) {
++      EGLint name = *attrs++, value = *attrs++;
++      if (name == EGL_CONTEXT_MAJOR_VERSION_KHR) req_major = value;
++      else if (name == EGL_CONTEXT_MINOR_VERSION_KHR) req_minor = value;
++      else if (name == EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR) profile = value;
++   }
++   memset(&attribs, 0, sizeof(attribs));
++   attribs.options.allow_higher_compat_version = true;
++   st_api_query_versions(&pz.frontend, &attribs.options, &core, &compat, &es1, &es2);
++   pz_log("[pz-egl] GL versions core=%d compat=%d requested=%d.%d profile=%x\n",
++          core, compat, req_major, req_minor, profile);
++   if (profile == EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT_KHR && req_major * 10 + req_minor >= 32) {
++      attribs.profile = API_OPENGL_CORE;
++      attribs.major = req_major;
++      attribs.minor = req_minor;
++   } else {
++      attribs.profile = API_OPENGL_COMPAT;
++      attribs.major = req_major ? req_major : compat / 10;
++      attribs.minor = req_major ? req_minor : compat % 10;
++   }
++   attribs.visual = pz_visual;
++   struct pz_context *ctx = calloc(1, sizeof(*ctx));
++   if (!ctx)
++      PZ_FAIL(EGL_BAD_ALLOC, EGL_NO_CONTEXT);
++   struct pz_context *shared = pz_context(share);
++   ctx->st = st_api_create_context(&pz.frontend, &attribs, &err, shared ? shared->st : NULL);
++   if (!ctx->st) {
++      pz_log("[pz-egl] st_api_create_context failed (%d)\n", err);
++      free(ctx);
++      PZ_FAIL(err == ST_CONTEXT_ERROR_NO_MEMORY ? EGL_BAD_ALLOC : EGL_BAD_MATCH, EGL_NO_CONTEXT);
++   }
++   ctx->magic = PZ_CTX_MAGIC;
++   PZ_UNLOCK();
++   return (EGLContext)ctx;
++}
++
++EGLAPI EGLBoolean EGLAPIENTRY
++eglDestroyContext(EGLDisplay d, EGLContext h)
++{
++   struct pz_context *ctx = pz_context(h);
++   (void)d;
++   PZ_LOCK();
++   if (!ctx)
++      PZ_FAIL(EGL_BAD_CONTEXT, EGL_FALSE);
++   if (ctx->current)
++      PZ_FAIL(EGL_BAD_ACCESS, EGL_FALSE);
++   ctx->magic = 0;
++   st_destroy_context(ctx->st);
++   free(ctx);
++   PZ_UNLOCK();
++   return EGL_TRUE;
++}
++
++EGLAPI EGLBoolean EGLAPIENTRY
++eglMakeCurrent(EGLDisplay d, EGLSurface draw, EGLSurface read, EGLContext h)
++{
++   struct pz_context *ctx = pz_context(h);
++   struct pz_surface *s = pz_surface(draw);
++   (void)read;
++   PZ_LOCK();
++   if (!pz_valid_display(d))
++      PZ_FAIL(EGL_BAD_DISPLAY, EGL_FALSE);
++   if (pz_cur_ctx)
++      _mesa_glthread_finish(pz_cur_ctx->st->ctx);
++   if (!ctx) {
++      st_api_make_current(NULL, NULL, NULL);
++      if (pz_cur_ctx) pz_cur_ctx->current = false;
++      if (pz_cur_draw) pz_cur_draw->current = false;
++      pz_cur_ctx = NULL;
++      pz_cur_draw = NULL;
++      PZ_UNLOCK();
++      return EGL_TRUE;
++   }
++   if (!st_api_make_current(ctx->st, s ? &s->drawable : NULL, s ? &s->drawable : NULL))
++      PZ_FAIL(EGL_BAD_MATCH, EGL_FALSE);
++   if (pz_cur_ctx) pz_cur_ctx->current = false;
++   if (pz_cur_draw) pz_cur_draw->current = false;
++   pz_cur_ctx = ctx;
++   pz_cur_draw = s;
++   ctx->current = true;
++   if (s) s->current = true;
++   PZ_UNLOCK();
++   return EGL_TRUE;
++}
++
++static void
++pz_before_flush(void *data)
++{
++   struct pz_surface *s = data;
++   struct pipe_context *pipe = pz_cur_ctx->st->pipe;
++   struct pipe_resource *back = s->textures[ST_ATTACHMENT_BACK_LEFT];
++   if (!back || !s->display)
++      return;
++   /* all GL work of the frame is queued: scale it into the swapchain image */
++   struct pipe_blit_info blit;
++   memset(&blit, 0, sizeof(blit));
++   blit.src.resource = back;
++   blit.src.format = back->format;
++   u_box_2d(0, 0, back->width0, back->height0, &blit.src.box);
++   blit.dst.resource = s->display;
++   blit.dst.format = s->display->format;
++   u_box_2d(0, 0, s->display->width0, s->display->height0, &blit.dst.box);
++   blit.mask = PIPE_MASK_RGBA;
++   blit.filter = PIPE_TEX_FILTER_LINEAR;
++   pipe->blit(pipe, &blit);
++   pipe->flush_resource(pipe, s->display);
++}
++
++EGLAPI EGLBoolean EGLAPIENTRY
++eglSwapBuffers(EGLDisplay d, EGLSurface h)
++{
++   struct pz_surface *s = pz_surface(h);
++   (void)d;
++   PZ_LOCK();
++   if (!s || !pz_cur_ctx || pz_cur_draw != s)
++      PZ_FAIL(EGL_BAD_SURFACE, EGL_FALSE);
++   struct st_context *st = pz_cur_ctx->st;
++   struct pipe_resource *display = s->display;
++   _mesa_glthread_finish(st->ctx);
++   st_context_flush(st, ST_FLUSH_FRONT | ST_FLUSH_END_OF_FRAME, NULL, pz_before_flush, s);
++   if (display) {
++      /* kopper: present the acquired swapchain image (dri/kopper.c path) */
++      pz.screen->flush_frontbuffer(pz.screen, st->pipe, display, 0, 0, &s->drawable, 0, NULL);
++      if (!zink_kopper_check(display))
++         pz_log("[pz-egl] swapchain lost\n");
++   }
++   p_atomic_inc(&s->drawable.stamp);
++   PZ_UNLOCK();
++   return EGL_TRUE;
++}
++
++EGLAPI EGLBoolean EGLAPIENTRY
++eglSwapInterval(EGLDisplay d, EGLint interval)
++{
++   (void)d;
++   PZ_LOCK();
++   if (pz_cur_draw) {
++      pz_cur_draw->swap_interval = interval;
++      pz_cur_draw->info.initial_swap_interval = interval;
++      if (pz_cur_draw->display)
++         zink_kopper_set_swap_interval(pz.screen, pz_cur_draw->display, interval);
++   }
++   PZ_UNLOCK();
++   return EGL_TRUE;
++}
++
++EGLAPI EGLContext EGLAPIENTRY eglGetCurrentContext(void) { return (EGLContext)pz_cur_ctx; }
++EGLAPI EGLDisplay EGLAPIENTRY eglGetCurrentDisplay(void) { return pz_cur_ctx ? (EGLDisplay)&pz : EGL_NO_DISPLAY; }
++EGLAPI EGLSurface EGLAPIENTRY eglGetCurrentSurface(EGLint rd) { (void)rd; return (EGLSurface)pz_cur_draw; }
++
++EGLAPI EGLBoolean EGLAPIENTRY
++eglWaitClient(void)
++{
++   if (pz_cur_ctx)
++      st_context_flush(pz_cur_ctx->st, ST_FLUSH_WAIT, NULL, NULL, NULL);
++   return EGL_TRUE;
++}
++
++EGLAPI EGLBoolean EGLAPIENTRY eglReleaseThread(void) { return eglMakeCurrent((EGLDisplay)&pz, NULL, NULL, NULL); }
++
++EGLAPI __eglMustCastToProperFunctionPointerType EGLAPIENTRY
++eglGetProcAddress(const char *name)
++{
++   if (!name)
++      return NULL;
++   if (!strcmp(name, "eglSetDisplayModePS5"))
++      return (__eglMustCastToProperFunctionPointerType)eglSetDisplayModePS5;
++   return (__eglMustCastToProperFunctionPointerType)_mesa_glapi_get_proc_address(name);
++}
++
++/* C++ objects (GLSL compiler) reference the thread_local init wrapper of the
++ * C TLS variable _mesa_glapi_tls_Context as a weak symbol; PS5 titles cannot
++ * leave it undefined (the native tool needs an import for every undefined
++ * symbol). The variable has no dynamic initializer: an empty function is the
++ * correct definition. */
++void ps5_zink_glapi_tls_init(void) __asm__("_ZTH23_mesa_glapi_tls_Context");
++void ps5_zink_glapi_tls_init(void) {}
+diff --git a/src/gallium/meson.build b/src/gallium/meson.build
+index 67011f5..47c4f31 100644
+--- a/src/gallium/meson.build
++++ b/src/gallium/meson.build
+@@ -204,6 +204,9 @@ if with_gallium_zink
+ else
+   driver_zink = declare_dependency()
+ endif
++if with_gallium_zink and get_option('radv-winsys') == 'ps5'
++  subdir('frontends/ps5egl')
++endif
+ if with_gallium_d3d12
+   subdir('drivers/d3d12')
+ else
+diff --git a/src/vulkan/wsi/wsi_common_videoout.c b/src/vulkan/wsi/wsi_common_videoout.c
+index 9e2ba81..211f290 100644
+--- a/src/vulkan/wsi/wsi_common_videoout.c
++++ b/src/vulkan/wsi/wsi_common_videoout.c
+@@ -250,9 +250,20 @@ struct wsi_videoout {
+ 
+ /* --- VideoOut ------------------------------------------------------------ */
+ 
++/* An application can veto high-frame-rate output at run time (a "120 Hz"
++ * option): it defines this function; by default the title's metadata decides. */
++bool ps5_videoout_want_high_frame_rate(void);
++__attribute__((weak)) bool
++ps5_videoout_want_high_frame_rate(void)
++{
++   return true;
++}
++
+ static bool
+ videoout_title_declares_high_frame_rate(void)
+ {
++   if (!ps5_videoout_want_high_frame_rate())
++      return false;
+    FILE *const file = fopen("/app0/sce_sys/param.json", "rb");
+    if (file == NULL)
+       return false;

@@ -1,0 +1,13 @@
+diff --git a/common/interface.cpp b/common/interface.cpp
+index a13a9fd..e79cba0 100644
+--- a/common/interface.cpp
++++ b/common/interface.cpp
+@@ -14,7 +14,7 @@
+ #include <unistd.h>
+ #define VRTLD_LIBDL_COMPAT
+ #include <vrtld.h>
+-#elif XASH_APPLE == 1
++#elif XASH_APPLE == 1 || defined( __FreeBSD__ )
+ #include <dlfcn.h>
+ #include <unistd.h>
+ #endif

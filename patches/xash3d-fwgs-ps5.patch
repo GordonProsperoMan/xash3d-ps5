@@ -27,6 +27,63 @@ index 7cd9c1f..daa108e 100644
  	#elif XASH_LINUX // we are building for Linux without SDL, only framebuffer is supported for now
  		#define XASH_VIDEO     VIDEO_FBDEV
  		#define XASH_INPUT     INPUT_EVDEV
+diff --git a/engine/client/cl_view.c b/engine/client/cl_view.c
+index c1b3ef1..6b52b7f 100644
+--- a/engine/client/cl_view.c
++++ b/engine/client/cl_view.c
+@@ -433,6 +433,42 @@ void V_RenderView( void )
+ 	ref.dllFuncs.GL_BackendEndFrame ();
+ }
+ 
++#if XASH_PS5
++/*
++================
++SCR_DrawPS5Cursor
++
++The menus rely on the system cursor, which a console doesn't have: draw an
++arrow at the USB mouse position (kbm_ps5.c) while the menu or console is open.
++================
++*/
++static void SCR_DrawPS5Cursor( void )
++{
++	extern qboolean ps5_mouse_present;
++	extern int ps5_cursor_x, ps5_cursor_y;
++	int tex = R_GetBuiltinTexture( REF_WHITE_TEXTURE );
++	float s = refState.height / 540.0f; // 1 unit = 2 px at 1080p
++
++	if( !ps5_mouse_present || ( cls.key_dest != key_menu && cls.key_dest != key_console ))
++		return;
++
++	ref.dllFuncs.GL_SetRenderMode( kRenderNormal );
++	for( int pass = 0; pass < 2; pass++ )
++	{
++		// pass 0: black outline (1 unit larger), pass 1: white arrow
++		float grow = pass ? 0.0f : 1.0f;
++		ref.dllFuncs.Color4ub( pass ? 255 : 0, pass ? 255 : 0, pass ? 255 : 0, 255 );
++		for( int r = 0; r < 12; r++ )
++		{
++			float w = r < 9 ? r * 0.7f + 1.0f : ( 12 - r ) * 0.6f;
++			ref.dllFuncs.R_DrawStretchPic( ps5_cursor_x - grow * s, ps5_cursor_y + ( r - grow ) * s,
++				( w + 2.0f * grow ) * s, ( 1.0f + 2.0f * grow ) * s, 0, 0, 1, 1, tex );
++		}
++	}
++	ref.dllFuncs.Color4ub( 255, 255, 255, 255 );
++}
++#endif
++
+ #define POINT_SIZE		16.0f
+ #define NODE_INTERVAL_X(x)	(x * 16.0f)
+ #define NODE_INTERVAL_Y(x)	(x * 16.0f)
+@@ -574,6 +610,9 @@ void V_PostRender( void )
+ 		Con_DrawDebug(); // must be last
+ 		Touch_Draw();
+ 		OSK_Draw();
++#if XASH_PS5
++		SCR_DrawPS5Cursor();
++#endif
+ 
+ 		S_ExtraUpdate();
+ 	}
 diff --git a/engine/client/input/in_joy.c b/engine/client/input/in_joy.c
 index 1da3114..826c5a2 100644
 --- a/engine/client/input/in_joy.c
@@ -85,6 +142,68 @@ index 1da3114..826c5a2 100644
  	Cvar_RegisterVariable( &joy_side );
  	Cvar_RegisterVariable( &joy_forward );
  
+diff --git a/engine/client/input/in_keys.c b/engine/client/input/in_keys.c
+index 2203268..bdafe38 100644
+--- a/engine/client/input/in_keys.c
++++ b/engine/client/input/in_keys.c
+@@ -168,6 +168,10 @@ static const keyname_t keynames[] =
+ };
+ 
+ static CVAR_DEFINE_AUTO( key_rotate, "0", FCVAR_ARCHIVE|FCVAR_FILTERABLE, "rotate arrow keys (0-3)" );
++// toggle crouch: press the +duck key once to crouch, once more to stand up
++// (holding crouch while pressing jump is awkward on a gamepad)
++static CVAR_DEFINE_AUTO( cl_duck_toggle, "1", FCVAR_ARCHIVE|FCVAR_FILTERABLE, "crouch key toggles crouching instead of being held" );
++static int duck_toggle_key = -1; // key that started the toggled crouch, -1 = standing
+ 
+ /*
+ ===================
+@@ -573,6 +577,7 @@ void Key_Init( void )
+ 		Key_SetBinding( keynames[i].keynum, keynames[i].binding );
+ 
+ 	Cvar_RegisterVariable( &key_rotate );
++	Cvar_RegisterVariable( &cl_duck_toggle );
+ 
+ }
+ 
+@@ -593,7 +598,27 @@ static void Key_AddKeyCommands( int key, const char *kb, qboolean down )
+ 		if( kb[i] == ';' || !kb[i] )
+ 		{
+ 			*buttonPtr = '\0';
+-			if( button[0] == '+' )
++			if( !Q_strcmp( button, "+duck" ) && ( cl_duck_toggle.value || duck_toggle_key >= 0 ))
++			{
++				char cmd[64];
++
++				// key release does nothing; each press flips the state
++				if( down )
++				{
++					if( duck_toggle_key < 0 && cl_duck_toggle.value )
++					{
++						duck_toggle_key = key;
++						Q_snprintf( cmd, sizeof( cmd ), "+duck %i\n", key );
++					}
++					else
++					{
++						Q_snprintf( cmd, sizeof( cmd ), "-duck %i\n", duck_toggle_key );
++						duck_toggle_key = -1;
++					}
++					Cbuf_AddText( cmd );
++				}
++			}
++			else if( button[0] == '+' )
+ 			{
+ 				char cmd[1024];
+ 
+@@ -995,6 +1020,9 @@ void GAME_EXPORT Key_ClearStates( void )
+ 	// ensure that only actual mouse buttons are released
+ 	IN_ClearMouseState();
+ 
++	// the client clears its button states below: forget a toggled crouch too
++	duck_toggle_key = -1;
++
+ 	if( clgame.hInstance )
+ 		clgame.dllFuncs.IN_ClearStates();
+ }
 diff --git a/engine/common/filesystem_engine.c b/engine/common/filesystem_engine.c
 index 9ed62eb..da2a925 100644
 --- a/engine/common/filesystem_engine.c
@@ -118,14 +237,62 @@ index 9ed62eb..da2a925 100644
  
  	return false;
 diff --git a/engine/common/host.c b/engine/common/host.c
-index f726046..e3bc28c 100644
+index f726046..aac5ff3 100644
 --- a/engine/common/host.c
 +++ b/engine/common/host.c
-@@ -380,6 +380,38 @@ Host_ChangeGame_f
+@@ -380,6 +380,86 @@ Host_ChangeGame_f
  Change game modification
  =================
  */
 +#if XASH_PS5
++// 120 Hz output: only the Zink/Vulkan build can switch VideoOut to 119.88 Hz
++// (xash_zink_shims.c overrides this weak default)
++__attribute__(( weak )) int ps5_hfr_available( void ) { return 0; }
++
++static int Host_PS5ReadRefresh( void )
++{
++	FILE *f = fopen( "/download0/xash_refresh.txt", "r" );
++	int hz = 60;
++
++	if( f )
++	{
++		if( fscanf( f, "%d", &hz ) != 1 )
++			hz = 60;
++		fclose( f );
++	}
++	return hz == 120 && ps5_hfr_available() ? 120 : 60;
++}
++
++static void Host_PS5Refresh_f( void )
++{
++	int hz;
++	FILE *f;
++
++	if( Cmd_Argc() != 2 )
++	{
++		Con_Printf( S_USAGE "ps5_refresh <60|120>\n" );
++		return;
++	}
++	hz = Q_atoi( Cmd_Argv( 1 )) == 120 ? 120 : 60;
++	if( hz == 120 && !ps5_hfr_available( ))
++	{
++		Con_Printf( "ps5_refresh: 120 Hz needs the Zink (Vulkan) build\n" );
++		return;
++	}
++	if( hz == Host_PS5ReadRefresh( ))
++		return;
++	f = fopen( "/download0/xash_refresh.txt", "w" );
++	if( !f )
++	{
++		Con_Printf( S_ERROR "ps5_refresh: can't save the setting\n" );
++		return;
++	}
++	fprintf( f, "%d\n", hz );
++	fclose( f );
++	// the output mode is chosen when the display opens: relaunch
++	Host_NewInstance( GI->gamefolder, "changing refresh rate" );
++}
++
 +static void Host_PS5Resolution_f( void )
 +{
 +	int h;
@@ -160,7 +327,7 @@ index f726046..e3bc28c 100644
  static void Host_ChangeGame_f( void )
  {
  	int	i;
-@@ -654,6 +686,16 @@ static qboolean Host_FilterTime( double time )
+@@ -654,6 +734,16 @@ static qboolean Host_FilterTime( double time )
  Host_Frame
  =================
  */
@@ -177,7 +344,7 @@ index f726046..e3bc28c 100644
  void Host_Frame( double time )
  {
  	// decide the simulation time
-@@ -665,16 +707,62 @@ void Host_Frame( double time )
+@@ -665,16 +755,66 @@ void Host_Frame( double time )
  	if( host.framecount == 0 )
  		Con_DPrintf( "Time to first frame: %.3f seconds\n", t1 - host.starttime );
  
@@ -208,6 +375,10 @@ index f726046..e3bc28c 100644
 +
 +#if XASH_PS5
 +	{
++		// 120 Hz output: the configs cap at 60 (fps_max 60), lift it to the refresh rate
++		if( host_maxfps.value == 60.0f && Cvar_VariableValue( "vid_ps5_120hz" ) > 0.0f )
++			Cvar_DirectSet( &host_maxfps, "120" );
++
 +		// PS5 perf probe: every 5 s, print real FPS and average CPU time per frame
 +		static double window_start;
 +		static double pure_sum;
@@ -240,30 +411,34 @@ index f726046..e3bc28c 100644
  }
  
  /*
-@@ -1235,6 +1323,9 @@ int EXPORT Host_Main( int argc, char **argv, const char *progname, int bChangeGa
+@@ -1235,6 +1375,12 @@ int EXPORT Host_Main( int argc, char **argv, const char *progname, int bChangeGa
  	if( pChangeGame != NULL && Sys_CanRestart( ))
  	{
  		Cmd_AddRestrictedCommand( "game", Host_ChangeGame_f, "change game" );
 +#if XASH_PS5
 +		Cmd_AddRestrictedCommand( "ps5_resolution", Host_PS5Resolution_f, "set render resolution (1080/1440/2160) and restart" );
++		Cmd_AddRestrictedCommand( "ps5_refresh", Host_PS5Refresh_f, "set display refresh rate (60/120) and restart" );
++		Cvar_FullSet( "vid_ps5_120hz_available", ps5_hfr_available() ? "1" : "0", FCVAR_READ_ONLY );
++		Cvar_FullSet( "vid_ps5_120hz", Host_PS5ReadRefresh() == 120 ? "1" : "0", FCVAR_READ_ONLY );
 +#endif
  		Cvar_Get( "host_allow_changegame", "1", FCVAR_READ_ONLY, "allows to change games" );
  	}
  	else
 diff --git a/engine/common/launcher.c b/engine/common/launcher.c
-index 70adc33..3759b98 100644
+index 70adc33..1fb35df 100644
 --- a/engine/common/launcher.c
 +++ b/engine/common/launcher.c
-@@ -15,6 +15,8 @@ GNU General Public License for more details.
+@@ -15,6 +15,9 @@ GNU General Public License for more details.
  
  #if XASH_ENABLE_MAIN
  #include "build.h"
 +#include <stdio.h>
 +#include <string.h>
++#include <sys/stat.h>
  #include "common.h"
  
  #if XASH_SDLMAIN
-@@ -41,10 +43,116 @@ int main( int argc, char **argv )
+@@ -41,10 +44,163 @@ int main( int argc, char **argv )
  #elif XASH_IOS
  	IOS_LaunchDialog();
  	szArgc = IOS_GetArgs( &szArgv );
@@ -370,7 +545,54 @@ index 70adc33..3759b98 100644
 +		// relaunch), and keep the thread parked if it does not act at once.
 +		extern int sceSystemServiceLoadExec( const char *path, char *const argv[] );
 +		extern unsigned int sleep( unsigned int seconds );
-+		int ret = Host_Main( szArgc, szArgv, XASH_GAMEDIR, 0, Sys_ChangeGame );
++		extern void PS5_Notify( const char *message );
++		int ret;
++
++		// The game files are not shipped (users copy their own). Without them
++		// the engine would just close: say what is missing instead.
++		{
++			static const char *required[] = { "valve/liblist.gam", "valve/halflife.wad", "valve/gfx.wad" };
++			const char *missing = NULL;
++			char path[256];
++			qboolean have_dir;
++			FILE *fp;
++
++			{
++				struct stat st;
++				have_dir = stat( "/app0/valve", &st ) == 0 && S_ISDIR( st.st_mode );
++			}
++
++			for( size_t k = 0; k < sizeof( required ) / sizeof( required[0] ) && !missing; k++ )
++			{
++				Q_snprintf( path, sizeof( path ), "/app0/%s", required[k] );
++				fp = fopen( path, "r" );
++				if( fp )
++					fclose( fp );
++				else
++					missing = required[k];
++			}
++
++			if( missing )
++			{
++				char msg[512];
++
++				if( !have_dir )
++					Q_snprintf( msg, sizeof( msg ), "XashPS5: Half-Life game files not found.\n"
++						"Copy your own Half-Life \"valve\" folder into the XashPS5 folder "
++						"(/data/homebrew/<title ID>/valve), then start XashPS5 again." );
++				else
++					Q_snprintf( msg, sizeof( msg ), "XashPS5: the \"valve\" folder is incomplete (%s is missing).\n"
++						"Copy the whole \"valve\" folder from your Half-Life installation again.", missing );
++				printf( "[XASH] %s\n", msg );
++				PS5_Notify( msg );
++				sleep( 3 ); // let the notification show before the title closes
++				sceSystemServiceLoadExec( "exit", NULL );
++				for( ;; )
++					sleep( 1 );
++			}
++		}
++
++		ret = Host_Main( szArgc, szArgv, XASH_GAMEDIR, 0, Sys_ChangeGame );
 +		printf( "[XASH] Host_Main returned %d, closing the application\n", ret );
 +		sceSystemServiceLoadExec( "exit", NULL );
 +		for( ;; )
@@ -467,10 +689,25 @@ index b4e5bb2..64ca30a 100644
  	// spew to stderr only in developer mode
  	if( host_developer.value )
 diff --git a/engine/common/system.c b/engine/common/system.c
-index 92aa2e4..dd68899 100644
+index 92aa2e4..29bbf75 100644
 --- a/engine/common/system.c
 +++ b/engine/common/system.c
-@@ -528,7 +528,7 @@ Returns true if execv-like syscall is available
+@@ -416,6 +416,14 @@ void Sys_Error( const char *error, ... )
+ 		Wcon_ShowConsole( false );
+ #endif
+ 		Sys_Print( text );
++#if XASH_PS5
++		{
++			extern void PS5_Notify( const char *message );
++			char note[MAX_PRINT_MSG + 32];
++			Q_snprintf( note, sizeof( note ), "XashPS5 error:\n%s", text );
++			PS5_Notify( note );
++		}
++#endif
+ 		Platform_MessageBox( "Xash Error", text, true );
+ 	}
+ 	else
+@@ -528,7 +536,7 @@ Returns true if execv-like syscall is available
  */
  qboolean Sys_CanRestart( void )
  {
@@ -479,7 +716,7 @@ index 92aa2e4..dd68899 100644
  	return true;
  #elif XASH_IOS
  	return false;
-@@ -550,11 +550,43 @@ but since engine will be unloaded during this call
+@@ -550,11 +558,43 @@ but since engine will be unloaded during this call
  it explicitly doesn't use internal allocation or string copy utils
  ==================
  */
@@ -525,10 +762,10 @@ index 92aa2e4..dd68899 100644
  	const char *exe = host.argv[0]; // arg 0 is always the full NRO path
  
 diff --git a/engine/platform/misc/lib_static.c b/engine/platform/misc/lib_static.c
-index 2814c6a..bb8b554 100644
+index 2814c6a..7927975 100644
 --- a/engine/platform/misc/lib_static.c
 +++ b/engine/platform/misc/lib_static.c
-@@ -38,8 +38,32 @@ static void *Lib_Find(table_t *tbl, const char *name )
+@@ -38,11 +38,48 @@ static void *Lib_Find(table_t *tbl, const char *name )
  	return 0;
  }
  
@@ -543,7 +780,9 @@ index 2814c6a..bb8b554 100644
  void *COM_LoadLibrary( const char *dllname, int build_ordinals_table, qboolean directpath )
  {
 +#if XASH_PS5
-+	if( !Q_strcmp( dllname, "server" ) || !Q_strcmp( dllname, "client" ))
++	// menu too: Counter-Strike (cs16-client) needs its own mainui build,
++	// which provides the team/class/buy menus through "MenuFactory"
++	if( !Q_strcmp( dllname, "server" ) || !Q_strcmp( dllname, "client" ) || !Q_strcmp( dllname, "menu" ))
 +	{
 +		char scoped[64];
 +		void *p;
@@ -561,6 +800,20 @@ index 2814c6a..bb8b554 100644
  	return Lib_Find((table_t*)libs, dllname);
  }
  
++#if XASH_PS5
++// Game code that loads the filesystem by name (ReGameDLL_CS: dlopen of
++// libfilesystem_stdio.so) can't on PS5: give it the statically linked
++// filesystem's CreateInterface instead.
++void *ps5_filesystem_create_interface( void )
++{
++	void *fs = Lib_Find((table_t*)libs, "filesystem_stdio" );
++	return fs ? Lib_Find((table_t*)fs, "CreateInterface" ) : NULL;
++}
++#endif
++
+ void COM_FreeLibrary( void *hInstance )
+ {
+ 	// impossible
 diff --git a/engine/platform/platform.h b/engine/platform/platform.h
 index 4a3afa4..34f8c16 100644
 --- a/engine/platform/platform.h
@@ -920,10 +1173,10 @@ index 0000000..68e51d1
 +}
 diff --git a/engine/platform/ps5/in_ps5.c b/engine/platform/ps5/in_ps5.c
 new file mode 100644
-index 0000000..e6b8bef
+index 0000000..d1b1424
 --- /dev/null
 +++ b/engine/platform/ps5/in_ps5.c
-@@ -0,0 +1,256 @@
+@@ -0,0 +1,269 @@
 +/*
 +in_ps5.c - PS5 system on-screen keyboard (sceImeDialog) for text input
 +Copyright (C) 2026 XashPS5 port
@@ -1129,6 +1382,19 @@ index 0000000..e6b8bef
 +void PS5_InputUpdate( void )
 +{
 +	int status;
++	static qboolean checked;
++	extern void PS5_KBM_Update( void );
++
++	PS5_KBM_Update(); // USB keyboard / mouse (kbm_ps5.c)
++
++	// Load the system keyboard once at startup: on success it turns the
++	// built-in keyboard off. Older builds saved osk_enable 1 in config.cfg
++	// when the system keyboard couldn't load, which kept it hidden for good.
++	if( !checked )
++	{
++		checked = true;
++		IME_LoadLibrary();
++	}
 +
 +	if( !ime_running )
 +	{
@@ -1175,6 +1441,283 @@ index 0000000..e6b8bef
 +			ime_wanted = false;
 +			Key_Event( K_ESCAPE, true );
 +			Key_Event( K_ESCAPE, false );
++		}
++	}
++}
++
++#endif // XASH_PS5
+diff --git a/engine/platform/ps5/kbm_ps5.c b/engine/platform/ps5/kbm_ps5.c
+new file mode 100644
+index 0000000..6560ef4
+--- /dev/null
++++ b/engine/platform/ps5/kbm_ps5.c
+@@ -0,0 +1,271 @@
++/*
++kbm_ps5.c - USB/wireless keyboard and mouse on PS5 (libSceKeyboard / libSceMouse)
++Copyright (C) 2026 XashPS5 port
++
++This program is free software: you can redistribute it and/or modify
++it under the terms of the GNU General Public License as published by
++the Free Software Foundation, either version 3 of the License, or
++(at your option) any later version.
++
++Record layouts and the load sequence (sysmodules 0x0106 / 0x00a9, init, open
++indexes 0 and 1, batched reads) follow BlackBearReloaded's device-tested
++ps5-native-gamepad-input-research (KEYBOARD-MOUSE.md).
++
++Keys go through SDL events (the SDL2 backend's scancode -> engine key table:
++binds are by physical position, so WASD works on any layout); typed text is
++built from ps5_kb_layout (us / fr). Mouse motion feeds Platform_MouseMove and a
++virtual cursor for the menus (Platform_GetMousePos).
++*/
++
++#include "common.h"
++#include "client.h"
++#include "input.h"
++#include "platform.h"
++#include "keydefs.h"
++#include "ref_common.h"
++
++#if XASH_PS5
++#include <SDL.h>
++#include <string.h>
++#include <stdint.h>
++
++int sceSysmoduleLoadModule( uint16_t id );
++int sceUserServiceGetForegroundUser( int *user_id );
++int sceKeyboardInit( void );
++int sceKeyboardOpen( int user, int type, int index, const void *param );
++int sceKeyboardRead( int handle, void *data, int count );
++int sceMouseInit( void );
++int sceMouseOpen( int user, int type, int index, const void *param );
++int sceMouseRead( int handle, void *data, int count );
++
++typedef struct
++{
++	uint64_t timestamp;
++	uint8_t  intercepted;
++	uint8_t  reserved0[7];
++	uint8_t  connected;
++	uint8_t  reserved1[3];
++	uint32_t length;
++	uint32_t leds;
++	uint32_t modifiers;
++	uint16_t keycodes[16];
++	uint8_t  reserved2[32];
++} ps5_kb_record_t;
++
++typedef struct
++{
++	uint64_t timestamp;
++	uint8_t  connected;
++	uint8_t  reserved0[3];
++	uint32_t buttons;
++	int32_t  x, y, wheel, tilt;
++	uint8_t  reserved1[8];
++} ps5_mouse_record_t;
++
++_Static_assert( sizeof( ps5_kb_record_t ) == 96, "keyboard record" );
++_Static_assert( sizeof( ps5_mouse_record_t ) == 40, "mouse record" );
++
++#define KBM_INDEXES 2
++static int kb_handle[KBM_INDEXES] = { -1, -1 };
++static int mouse_handle[KBM_INDEXES] = { -1, -1 };
++static qboolean kbm_tried;
++static qboolean kb_seen, mouse_seen;
++
++static uint8_t  kb_down[256];        // HID usage -> pressed
++static uint32_t kb_modifiers;
++static uint32_t mouse_buttons;
++
++// read by in_sdl2.c
++float    ps5_mouse_dx, ps5_mouse_dy;
++int      ps5_cursor_x, ps5_cursor_y;
++qboolean ps5_mouse_present;
++
++static CVAR_DEFINE_AUTO( ps5_kb_layout, "us", FCVAR_ARCHIVE, "USB keyboard layout for typed text: us or fr" );
++
++// HID usage -> character, unshifted / shifted, for HID 0x04 (A) .. 0x38 (/)
++static const char us_lo[] = "abcdefghijklmnopqrstuvwxyz1234567890\n\x1b\b\t -=[]\\#;'`,./";
++static const char us_hi[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()\n\x1b\b\t _+{}|~:\"~<>?";
++// AZERTY (France) by physical position; 0 = character outside ASCII (é è ç à ù ...)
++static const char fr_lo[] = "qbcdefghijkl,noparstuvzxyw" "&\0\"'(-\0_\0\0" "\n\x1b\b\t " ")=^$**" "m\0\0;:!";
++static const char fr_hi[] = "QBCDEFGHIJKL?NOPARSTUVZXYW" "1234567890" "\n\x1b\b\t " "\0+\0\0\0\0" "M%\0./\0";
++_Static_assert( sizeof( us_lo ) == sizeof( fr_lo ) && sizeof( us_hi ) == sizeof( fr_hi ) && sizeof( us_lo ) == 54, "layout tables" );
++
++static void KBM_Open( void )
++{
++	int user = -1, ret;
++
++	kbm_tried = true;
++	Cvar_RegisterVariable( &ps5_kb_layout );
++
++	if( sceUserServiceGetForegroundUser( &user ) != 0 )
++	{
++		Con_Printf( "KBM: no foreground user\n" );
++		return;
++	}
++
++	ret = sceSysmoduleLoadModule( 0x0106 );
++	Con_Printf( "KBM: keyboard sysmodule -> 0x%x\n", ret );
++	if( ret >= 0 && ( ret = sceKeyboardInit( )) >= 0 )
++	{
++		for( int i = 0; i < KBM_INDEXES; i++ )
++		{
++			kb_handle[i] = sceKeyboardOpen( user, 0, i, NULL );
++			Con_Printf( "KBM: keyboard open index %d -> 0x%x\n", i, kb_handle[i] );
++		}
++	}
++	else Con_Printf( "KBM: sceKeyboardInit -> 0x%x\n", ret );
++
++	ret = sceSysmoduleLoadModule( 0x00a9 );
++	Con_Printf( "KBM: mouse sysmodule -> 0x%x\n", ret );
++	if( ret >= 0 && ( ret = sceMouseInit( )) >= 0 )
++	{
++		for( int i = 0; i < KBM_INDEXES; i++ )
++		{
++			uint8_t param[8] = { 0 };
++			mouse_handle[i] = sceMouseOpen( user, 0, i, param );
++			Con_Printf( "KBM: mouse open index %d -> 0x%x\n", i, mouse_handle[i] );
++		}
++	}
++	else Con_Printf( "KBM: sceMouseInit -> 0x%x\n", ret );
++}
++
++static char KBM_Char( int usage, qboolean shift, qboolean caps )
++{
++	qboolean fr = !Q_stricmp( ps5_kb_layout.string, "fr" );
++	const char *lo = fr ? fr_lo : us_lo, *hi = fr ? fr_hi : us_hi;
++	size_t n = fr ? sizeof( fr_lo ) - 1 : sizeof( us_lo ) - 1;
++	int idx = usage - 0x04;
++
++	if( usage >= 0x54 && usage <= 0x63 ) // keypad
++		return "/*-+\n1234567890."[usage - 0x54];
++	if( usage == 0x64 ) // the extra ISO key (< > on AZERTY)
++		return shift ? '>' : '<';
++	if( idx < 0 || (size_t)idx >= n )
++		return 0;
++	// caps lock acts like shift for letters only
++	if( caps && ( lo[idx] >= 'a' && lo[idx] <= 'z' ))
++		shift = !shift;
++	return shift ? hi[idx] : lo[idx];
++}
++
++static void KBM_Key( int usage, qboolean down )
++{
++	SDL_Event ev;
++	char ch;
++
++	memset( &ev, 0, sizeof( ev ));
++	ev.type = down ? SDL_KEYDOWN : SDL_KEYUP;
++	ev.key.state = down ? SDL_PRESSED : SDL_RELEASED;
++	ev.key.keysym.scancode = (SDL_Scancode)usage;
++	ev.key.keysym.sym = SDL_GetKeyFromScancode( (SDL_Scancode)usage );
++	SDL_PushEvent( &ev );
++
++	if( !down || ( kb_modifiers & 0x11 )) // no text with Ctrl
++		return;
++	ch = KBM_Char( usage, ( kb_modifiers & 0x22 ) != 0, false );
++	if( ch >= 32 && ch < 127 )
++	{
++		memset( &ev, 0, sizeof( ev ));
++		ev.type = SDL_TEXTINPUT;
++		ev.text.text[0] = ch;
++		SDL_PushEvent( &ev );
++	}
++}
++
++static void KBM_Modifiers( uint32_t mods )
++{
++	// bit -> HID usage of the modifier key (0xE0..0xE7)
++	uint32_t diff = mods ^ kb_modifiers;
++	kb_modifiers = mods;
++	for( int b = 0; b < 8; b++ )
++		if( diff & BIT( b ))
++			KBM_Key( 0xE0 + b, ( mods & BIT( b )) != 0 );
++}
++
++static void KBM_KeyboardRecord( const ps5_kb_record_t *r )
++{
++	uint8_t now[256] = { 0 };
++
++	if( !r->connected || r->intercepted )
++		return;
++	if( !kb_seen )
++	{
++		kb_seen = true;
++		Con_Printf( "KBM: keyboard input received\n" );
++	}
++
++	for( int i = 0; i < 16; i++ )
++		if( r->keycodes[i] && r->keycodes[i] < 256 )
++			now[r->keycodes[i]] = 1;
++
++	KBM_Modifiers( r->modifiers );
++	for( int u = 4; u < 256; u++ )
++	{
++		if( u >= 0xE0 && u <= 0xE7 )
++			continue;
++		if( now[u] != kb_down[u] )
++		{
++			kb_down[u] = now[u];
++			KBM_Key( u, now[u] );
++		}
++	}
++}
++
++static void KBM_MouseRecord( const ps5_mouse_record_t *r )
++{
++	int w, h;
++
++	if( !r->connected || ( r->buttons & 0x80000000u ))
++		return;
++	if( !mouse_seen )
++	{
++		mouse_seen = true;
++		Con_Printf( "KBM: mouse input received\n" );
++	}
++	ps5_mouse_present = true;
++
++	ps5_mouse_dx += r->x;
++	ps5_mouse_dy += r->y;
++
++	w = refState.width > 0 ? refState.width : 1920;
++	h = refState.height > 0 ? refState.height : 1080;
++	ps5_cursor_x = bound( 0, ps5_cursor_x + r->x, w - 1 );
++	ps5_cursor_y = bound( 0, ps5_cursor_y + r->y, h - 1 );
++
++	for( int b = 0; b < 5; b++ )
++	{
++		uint32_t bit = BIT( b );
++		if(( r->buttons ^ mouse_buttons ) & bit )
++			IN_MouseEvent( b, ( r->buttons & bit ) != 0 );
++	}
++	mouse_buttons = r->buttons & 0x1f;
++
++	if( r->wheel )
++		IN_MWheelEvent( r->wheel );
++}
++
++void PS5_KBM_Update( void )
++{
++	if( !kbm_tried )
++		KBM_Open();
++
++	for( int i = 0; i < KBM_INDEXES; i++ )
++	{
++		if( kb_handle[i] >= 0 )
++		{
++			ps5_kb_record_t recs[16];
++			int n = sceKeyboardRead( kb_handle[i], recs, 16 );
++			for( int k = 0; k < n && k < 16; k++ )
++				KBM_KeyboardRecord( &recs[k] );
++		}
++		if( mouse_handle[i] >= 0 )
++		{
++			ps5_mouse_record_t recs[64];
++			int n = sceMouseRead( mouse_handle[i], recs, 64 );
++			for( int k = 0; k < n && k < 64; k++ )
++				KBM_MouseRecord( &recs[k] );
 +		}
 +	}
 +}
@@ -1662,10 +2205,10 @@ index 0000000..0c74129
 +#endif // XASH_PS5
 diff --git a/engine/platform/ps5/sys_ps5.c b/engine/platform/ps5/sys_ps5.c
 new file mode 100644
-index 0000000..6029649
+index 0000000..65e3941
 --- /dev/null
 +++ b/engine/platform/ps5/sys_ps5.c
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,126 @@
 +/*
 +sys_ps5.c - PS5 homebrew platform backend
 +Copyright (C) 2026
@@ -1762,6 +2305,31 @@ index 0000000..6029649
 +	return true;
 +}
 +
++/*
++========================
++PS5_Notify
++
++Pop-up notification (top right of the screen, also visible after the title
++has closed). Used for fatal errors: the SDL message box does nothing on PS5.
++========================
++*/
++typedef struct
++{
++	char reserved[45];
++	char message[3075];
++} ps5_notify_request_t;
++
++int sceKernelSendNotificationRequest( int device, ps5_notify_request_t *req, size_t size, int blocking );
++
++void PS5_Notify( const char *message )
++{
++	static ps5_notify_request_t req; // 3 KiB: keep it off the stack
++
++	memset( &req, 0, sizeof( req ));
++	Q_strncpy( req.message, message, sizeof( req.message ));
++	sceKernelSendNotificationRequest( 0, &req, sizeof( req ), 0 );
++}
++
 +/* Override ps5-opengl app_heap.c's weak 128 MiB default: Xash3D + Half-Life
 + * data needs far more; >128 MiB is served from CPU-cached direct memory. */
 +const size_t ps5_opengl_heap_size = 1024u * 1024u * 1024u;
@@ -1782,10 +2350,44 @@ index fbcc883..472fe9c 100644
  
  /*
 diff --git a/engine/platform/sdl2/in_sdl2.c b/engine/platform/sdl2/in_sdl2.c
-index 6d66e09..b92a682 100644
+index 6d66e09..1cd483e 100644
 --- a/engine/platform/sdl2/in_sdl2.c
 +++ b/engine/platform/sdl2/in_sdl2.c
-@@ -183,6 +183,7 @@ SDLash_EnableTextInput
+@@ -44,6 +44,17 @@ Platform_GetMousePos
+ void GAME_EXPORT Platform_GetMousePos( int *x, int *y )
+ {
+ 	SDL_GetMouseState( x, y );
++#if XASH_PS5
++	{
++		extern qboolean ps5_mouse_present;
++		extern int ps5_cursor_x, ps5_cursor_y;
++		if( ps5_mouse_present )
++		{
++			*x = ps5_cursor_x;
++			*y = ps5_cursor_y;
++		}
++	}
++#endif
+ 
+ 	if( x )
+ 		*x *= refState.scale_x;
+@@ -75,6 +86,15 @@ void Platform_MouseMove( float *x, float *y )
+ 	SDL_GetRelativeMouseState( &m_x, &m_y );
+ 	*x = (float)m_x;
+ 	*y = (float)m_y;
++#if XASH_PS5
++	{
++		// native mouse (kbm_ps5.c): SDL doesn't see it
++		extern float ps5_mouse_dx, ps5_mouse_dy;
++		*x += ps5_mouse_dx;
++		*y += ps5_mouse_dy;
++		ps5_mouse_dx = ps5_mouse_dy = 0.0f;
++	}
++#endif
+ }
+ 
+ /*
+@@ -183,6 +203,7 @@ SDLash_EnableTextInput
  
  =============
  */
@@ -1793,7 +2395,7 @@ index 6d66e09..b92a682 100644
  void Platform_EnableTextInput( qboolean enable, int x, int y, int w, int h )
  {
  	if( !enable )
-@@ -204,6 +205,7 @@ void Platform_EnableTextInput( qboolean enable, int x, int y, int w, int h )
+@@ -204,6 +225,7 @@ void Platform_EnableTextInput( qboolean enable, int x, int y, int w, int h )
  	SDL_SetTextInputRect( &rect );
  	SDL_StartTextInput();
  }
@@ -1820,7 +2422,7 @@ index 99d45b0..653586c 100644
  }
  
 diff --git a/engine/platform/sdl2/sys_sdl2.c b/engine/platform/sdl2/sys_sdl2.c
-index ac3a43c..f3701f0 100644
+index ac3a43c..c954136 100644
 --- a/engine/platform/sdl2/sys_sdl2.c
 +++ b/engine/platform/sdl2/sys_sdl2.c
 @@ -127,6 +127,22 @@ void SDLash_Init( void )
@@ -1828,7 +2430,7 @@ index ac3a43c..f3701f0 100644
  	}
  
 +#if XASH_PS5
-+	// render resolution chosen in Video options (ps5_resolution command),
++	// render resolution chosen in Video options (ps5_resolution command, 4K by default),
 +	// applied by the SDL G19 driver before EGL initialisation
 +	{
 +		char res[16] = "";
@@ -1839,8 +2441,8 @@ index ac3a43c..f3701f0 100644
 +				res[strcspn( res, " \t\r\n" )] = 0;
 +			fclose( f );
 +		}
-+		if( res[0] )
-+			SDL_SetHint( "SDL_PS5_RESOLUTION", res );
++		// 4K by default (no choice saved yet)
++		SDL_SetHint( "SDL_PS5_RESOLUTION", res[0] ? res : "2160" );
 +	}
 +#endif
  	if( SDL_Init( SDL_INIT_TIMER | SDL_INIT_VIDEO | SDL_INIT_EVENTS ) )
@@ -1905,7 +2507,7 @@ index e85afd2..66a9cd8 100644
  
  int GL_SetAttribute( int attr, int val )
 diff --git a/engine/wscript b/engine/wscript
-index 791b9d2..7ae9373 100644
+index 791b9d2..fd39d6b 100644
 --- a/engine/wscript
 +++ b/engine/wscript
 @@ -115,6 +115,32 @@ def configure(conf):
@@ -1951,7 +2553,7 @@ index 791b9d2..7ae9373 100644
  			defines += ['XASH_SDL=%d' % bld.env.XASH_SDL]
  
  		if bld.get_define('HAVE_FFMPEG'):
-@@ -295,9 +322,31 @@ def build(bld):
+@@ -295,9 +322,32 @@ def build(bld):
  
  		if bld.env.DEST_OS in ['nswitch', 'psvita', 'emscripten']:
  			install_path = None
@@ -1978,7 +2580,8 @@ index 791b9d2..7ae9373 100644
 +			stub_dir = bld.path.parent.find_node('scripts/ps5_stubs').abspath()
 +			# in_ps5.c: system keyboard = ImeDialog + CommonDialog (link-only stub, see scripts/ps5_stubs)
 +			linkflags += ['-lSceAudioOut', '-lSceUserService', '-lSceSysmodule', '-lSceImeDialog',
-+				stub_dir + '/libSceCommonDialog.so'] # platform/ps5/s_ps5.c, in_ps5.c
++				stub_dir + '/libSceCommonDialog.so', # platform/ps5/s_ps5.c, in_ps5.c
++				'-lSceKeyboard', stub_dir + '/libSceMouse.so'] # platform/ps5/kbm_ps5.c
 +
  		if bld.env.DEST_OS == 'emscripten':
  			linkflags = ['-sINITIAL_MEMORY=134217728', '-sALLOW_MEMORY_GROWTH=1', '-sSTACK_SIZE=16777216']
@@ -2094,6 +2697,21 @@ index 6ffbd4b..860d631 100644
  
  		for( int i = 0; i < dirs.numstrings; i++ )
  		{
+diff --git a/filesystem/sys.c b/filesystem/sys.c
+index 712c3e4..ec2282f 100644
+--- a/filesystem/sys.c
++++ b/filesystem/sys.c
+@@ -66,7 +66,9 @@ GNU General Public License for more details.
+ 	#define S_ISDIR( m ) ( FBitSet( m, S_IFMT ) == S_IFDIR )
+ #endif
+ 
+-#if !XASH_PSVITA && !XASH_NSWITCH
++// PS5: the libc dup() issues a raw syscall, which native titles may not
++// (SYSTEM_ILLEGAL_FUNCTION_CALL when opening a file inside a .pk3): reopen instead
++#if !XASH_PSVITA && !XASH_NSWITCH && !XASH_PS5
+ 	#define HAVE_DUP
+ #endif
+ 
 diff --git a/ref/gl/gl2_shim/gl2_shim.c b/ref/gl/gl2_shim/gl2_shim.c
 index 91541c9..b37131d 100644
 --- a/ref/gl/gl2_shim/gl2_shim.c
@@ -2614,6 +3232,22 @@ index 0000000..74447b2
 + * SPDX-License-Identifier: GPL-3.0-or-later
 + */
 +void sceCommonDialogInitialize( void ) { }
+diff --git a/scripts/ps5_stubs/mouse_link_stub.c b/scripts/ps5_stubs/mouse_link_stub.c
+new file mode 100644
+index 0000000..dcc3d2d
+--- /dev/null
++++ b/scripts/ps5_stubs/mouse_link_stub.c
+@@ -0,0 +1,10 @@
++/*
++ * Link-only facade for libSceMouse (absent from the public SDK stubs): gives
++ * the linker and ps5-native-tool the imports; the system module provides the
++ * functions at run time (loaded with sceSysmoduleLoadModule(0x00a9)).
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++int sceMouseInit( void ) { return -1; }
++int sceMouseOpen( int user, int type, int index, const void *param ) { return -1; }
++int sceMouseRead( int handle, void *data, int count ) { return -1; }
++int sceMouseClose( int handle ) { return -1; }
 diff --git a/scripts/waifulib/xcompile.py b/scripts/waifulib/xcompile.py
 index 53736ee..0fca7a7 100644
 --- a/scripts/waifulib/xcompile.py

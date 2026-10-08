@@ -1,0 +1,74 @@
+diff --git a/regamedll/engine/osconfig.h b/regamedll/engine/osconfig.h
+index 554b1d8..5a38ebd 100644
+--- a/regamedll/engine/osconfig.h
++++ b/regamedll/engine/osconfig.h
+@@ -88,7 +88,7 @@
+ 	#include <sys/stat.h>
+ 	#include <sys/time.h>
+ 	#include <sys/types.h>
+-#if !defined(__APPLE__)
++#if !defined(__APPLE__) && !defined(__PROSPERO__) && !defined(__FreeBSD__)
+ 	#include <sys/sysinfo.h>
+ #else
+ 	#include <sys/sysctl.h>
+diff --git a/regamedll/game_shared/counter.h b/regamedll/game_shared/counter.h
+index 84f03ce..051f256 100644
+--- a/regamedll/game_shared/counter.h
++++ b/regamedll/game_shared/counter.h
+@@ -38,7 +38,7 @@
+ 	#include <sys/types.h>
+ 	#include <fcntl.h>
+ 	#include <unistd.h>
+-	#ifdef __APPLE__
++	#if defined(__APPLE__) || defined(__FreeBSD__)
+ 		#include <limits.h>
+ 	#else
+ 		#include <linux/limits.h>
+diff --git a/regamedll/public/FileSystem.cpp b/regamedll/public/FileSystem.cpp
+index 3b0f033..5f57f10 100644
+--- a/regamedll/public/FileSystem.cpp
++++ b/regamedll/public/FileSystem.cpp
+@@ -31,8 +31,21 @@
+ IFileSystem *g_pFileSystem = nullptr;
+ CSysModule *g_pFileSystemModule = nullptr;
+ 
++#if defined(__PROSPERO__)
++// PS5: no dlopen; the engine links filesystem_stdio statically and exposes
++// its CreateInterface (engine/platform/misc/lib_static.c)
++extern "C" void *ps5_filesystem_create_interface();
++#endif
++
+ bool FileSystem_Init()
+ {
++#if defined(__PROSPERO__)
++	CreateInterfaceFn ps5Factory = (CreateInterfaceFn)ps5_filesystem_create_interface();
++	if (!ps5Factory)
++		return false;
++	g_pFileSystem = (IFileSystem *)ps5Factory(FILESYSTEM_INTERFACE_VERSION, nullptr);
++	return g_pFileSystem != nullptr;
++#endif
+ 	g_pFileSystemModule = Sys_LoadModule(STDIO_FILESYSTEM_LIB);
+ 	if (!g_pFileSystemModule)
+ 	{
+diff --git a/regamedll/public/tier0/platform.h b/regamedll/public/tier0/platform.h
+index eaf294f..2b07a8e 100644
+--- a/regamedll/public/tier0/platform.h
++++ b/regamedll/public/tier0/platform.h
+@@ -30,7 +30,7 @@
+ 
+ #include "osconfig.h"
+ 
+-#if !defined(__APPLE__)
++#if !defined(__APPLE__) && !defined(__FreeBSD__)
+ #include <malloc.h> // need this for _alloca
+ #endif
+ #include <string.h> // need this for memset
+@@ -75,7 +75,7 @@
+ // Can't use extern "C" when DLL exporting a global
+ #define DLL_GLOBAL_EXPORT extern __declspec(dllexport)
+ #define DLL_GLOBAL_IMPORT extern __declspec(dllimport)
+-#elif defined __linux__ || defined __APPLE__
++#elif defined __linux__ || defined __APPLE__ || defined __FreeBSD__
+ 
+ // Used for dll exporting and importing
+ #define DLL_EXPORT extern "C"
