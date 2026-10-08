@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased (next version)
+
+### New
+- Right-stick aim curve: one circular deadzone for the whole stick plus a response curve (`joy_aim_curve`, `joy_aim_deadzone`, `joy_aim_exponent`), with look speeds 140 (yaw) / 105 (pitch). Precise small adjustments, fast full turns. Idea and tuning from [mpereiraesaa/ps5-xash3d-halflife](https://github.com/mpereiraesaa/ps5-xash3d-halflife).
+- The previous run's log is kept as `/data/xash_log_previous.txt`, so a crash log survives relaunching the game.
+- `scripts/audit_release.py`: checks a release zip against an allowlist (no game data, correct title ID, signed eboot) before publishing. Idea from mpereiraesaa/ps5-xash3d-halflife.
+
+### Changed
+- Release builds no longer run with verbose developer output (`-dev 2`) or print performance counters; create `/data/xash_debug.txt` on the console to turn them back on.
+
 ## V1.2
 
 ### New

@@ -27,6 +27,64 @@ index 7cd9c1f..daa108e 100644
  	#elif XASH_LINUX // we are building for Linux without SDL, only framebuffer is supported for now
  		#define XASH_VIDEO     VIDEO_FBDEV
  		#define XASH_INPUT     INPUT_EVDEV
+diff --git a/engine/client/input/in_joy.c b/engine/client/input/in_joy.c
+index 1da3114..826c5a2 100644
+--- a/engine/client/input/in_joy.c
++++ b/engine/client/input/in_joy.c
+@@ -68,6 +68,12 @@ static qboolean joy_initialized;
+ 
+ static CVAR_DEFINE_AUTO( joy_pitch,   "100.0", FCVAR_ARCHIVE | FCVAR_FILTERABLE, "joystick pitch sensitivity" );
+ static CVAR_DEFINE_AUTO( joy_yaw,     "100.0", FCVAR_ARCHIVE | FCVAR_FILTERABLE, "joystick yaw sensitivity" );
++// Radial look curve (idea from mpereiraesaa/ps5-xash3d-halflife): one circular
++// deadzone for the whole right stick instead of one per axis, then a power
++// curve, so small deflections aim precisely and full deflection turns fast.
++static CVAR_DEFINE_AUTO( joy_aim_curve,    "0",   FCVAR_ARCHIVE | FCVAR_FILTERABLE, "radial right-stick look: circular deadzone + power curve" );
++static CVAR_DEFINE_AUTO( joy_aim_deadzone, "0.10", FCVAR_ARCHIVE | FCVAR_FILTERABLE, "radial look deadzone, 0 to 0.4 of full deflection" );
++static CVAR_DEFINE_AUTO( joy_aim_exponent, "1.6", FCVAR_ARCHIVE | FCVAR_FILTERABLE, "radial look response curve exponent, 1 (linear) to 3" );
+ static CVAR_DEFINE_AUTO( joy_side,    "1.0", FCVAR_ARCHIVE | FCVAR_FILTERABLE, "joystick side sensitivity. Values from -1.0 to 1.0" );
+ static CVAR_DEFINE_AUTO( joy_forward, "1.0", FCVAR_ARCHIVE | FCVAR_FILTERABLE, "joystick forward sensitivity. Values from -1.0 to 1.0" );
+ static CVAR_DEFINE_AUTO( joy_lt_threshold, "16384", FCVAR_ARCHIVE | FCVAR_FILTERABLE, "left trigger threshold. Value from 0 to 32767");
+@@ -508,8 +514,28 @@ void Joy_FinalizeMove( float *fw, float *side, float *dpitch, float *dyaw )
+ 
+ 	*fw     -= joy_forward.value * (float)joyaxis[JOY_AXIS_FWD ].val/(float)SHRT_MAX;  // must be form -1.0 to 1.0
+ 	*side   += joy_side.value    * (float)joyaxis[JOY_AXIS_SIDE].val/(float)SHRT_MAX;
+-	*dpitch += joy_pitch.value * (float)joyaxis[JOY_AXIS_PITCH].val/(float)SHRT_MAX * host.realframetime;
+-	*dyaw   -= joy_yaw.value   * (float)joyaxis[JOY_AXIS_YAW  ].val/(float)SHRT_MAX * host.realframetime;
++	if( joy_aim_curve.value )
++	{
++		// raw values: the per-axis deadzones would cut a square hole first
++		float x = (float)joyaxis[JOY_AXIS_YAW  ].rawval / (float)SHRT_MAX;
++		float y = (float)joyaxis[JOY_AXIS_PITCH].rawval / (float)SHRT_MAX;
++		float r = sqrtf( x * x + y * y );
++		float dz = bound( 0.0f, joy_aim_deadzone.value, 0.4f );
++		float power = bound( 1.0f, joy_aim_exponent.value, 3.0f );
++
++		if( r > dz )
++		{
++			float magnitude = powf(( Q_min( r, 1.0f ) - dz ) / ( 1.0f - dz ), power ) / r;
++
++			*dpitch += joy_pitch.value * y * magnitude * host.realframetime;
++			*dyaw   -= joy_yaw.value   * x * magnitude * host.realframetime;
++		}
++	}
++	else
++	{
++		*dpitch += joy_pitch.value * (float)joyaxis[JOY_AXIS_PITCH].val/(float)SHRT_MAX * host.realframetime;
++		*dyaw   -= joy_yaw.value   * (float)joyaxis[JOY_AXIS_YAW  ].val/(float)SHRT_MAX * host.realframetime;
++	}
+ 
+ 	if( joy_gyro_enable.value && joy_have_gyro.value && (int)joy_calibrated.value == JOY_CALIBRATED )
+ 	{
+@@ -802,6 +828,9 @@ void Joy_Init( void )
+ 
+ 	Cvar_RegisterVariable( &joy_pitch );
+ 	Cvar_RegisterVariable( &joy_yaw );
++	Cvar_RegisterVariable( &joy_aim_curve );
++	Cvar_RegisterVariable( &joy_aim_deadzone );
++	Cvar_RegisterVariable( &joy_aim_exponent );
+ 	Cvar_RegisterVariable( &joy_side );
+ 	Cvar_RegisterVariable( &joy_forward );
+ 
 diff --git a/engine/common/filesystem_engine.c b/engine/common/filesystem_engine.c
 index 9ed62eb..da2a925 100644
 --- a/engine/common/filesystem_engine.c
@@ -60,7 +118,7 @@ index 9ed62eb..da2a925 100644
  
  	return false;
 diff --git a/engine/common/host.c b/engine/common/host.c
-index f726046..95c848f 100644
+index f726046..e3bc28c 100644
 --- a/engine/common/host.c
 +++ b/engine/common/host.c
 @@ -380,6 +380,38 @@ Host_ChangeGame_f
@@ -163,11 +221,11 @@ index f726046..95c848f 100644
 +		if( now - window_start >= 5.0 )
 +		{
 +			extern double ps5_prof_swap;
-+			Con_Printf( "PS5PERF arrays=%d array_ms=%.2f lm_uploads=%.1f lm_ms=%.2f array_setup_ms=%.2f prog_ms=%.2f upload_ms=%.2f idx_ms=%.2f\n", (int)( ps5_shim_array_count / frames ), 1000.0 * ps5_shim_array_time / frames, ps5_prof_counters[6] / frames, 1000.0 * ps5_prof_counters[5] / frames, 1000.0 * ps5_prof_counters[7] / frames, 1000.0 * ps5_prof_counters[8] / frames, 1000.0 * ps5_prof_counters[9] / frames, 1000.0 * ps5_prof_counters[10] / frames );
++			Con_DPrintf( "PS5PERF arrays=%d array_ms=%.2f lm_uploads=%.1f lm_ms=%.2f array_setup_ms=%.2f prog_ms=%.2f upload_ms=%.2f idx_ms=%.2f\n", (int)( ps5_shim_array_count / frames ), 1000.0 * ps5_shim_array_time / frames, ps5_prof_counters[6] / frames, 1000.0 * ps5_prof_counters[5] / frames, 1000.0 * ps5_prof_counters[7] / frames, 1000.0 * ps5_prof_counters[8] / frames, 1000.0 * ps5_prof_counters[9] / frames, 1000.0 * ps5_prof_counters[10] / frames );
 +			ps5_prof_counters[7] = ps5_prof_counters[8] = ps5_prof_counters[9] = ps5_prof_counters[10] = 0.0;
 +			ps5_prof_counters[5] = ps5_prof_counters[6] = 0.0;
 +			ps5_shim_array_time = 0.0; ps5_shim_array_count = 0;
-+			Con_Printf( "PS5PERF fps=%.1f cpu_ms=%.2f in=%.2f sv=%.2f cl=%.2f swap=%.2f draws=%d verts=%d draw_ms=%.2f state=%d\n", frames / ( now - window_start ),
++			Con_DPrintf( "PS5PERF fps=%.1f cpu_ms=%.2f in=%.2f sv=%.2f cl=%.2f swap=%.2f draws=%d verts=%d draw_ms=%.2f state=%d\n", frames / ( now - window_start ),
 +				1000.0 * pure_sum / frames, 1000.0 * ps5_prof_in / frames, 1000.0 * ps5_prof_sv / frames,
 +				1000.0 * ps5_prof_cl / frames, 1000.0 * ps5_prof_swap / frames,
 +				(int)( ps5_shim_flush_count / frames ), (int)( ps5_shim_flush_verts / frames ), 1000.0 * ps5_shim_flush_time / frames, cls.state );
@@ -193,7 +251,7 @@ index f726046..95c848f 100644
  	}
  	else
 diff --git a/engine/common/launcher.c b/engine/common/launcher.c
-index 70adc33..77404ef 100644
+index 70adc33..3759b98 100644
 --- a/engine/common/launcher.c
 +++ b/engine/common/launcher.c
 @@ -15,6 +15,8 @@ GNU General Public License for more details.
@@ -205,7 +263,7 @@ index 70adc33..77404ef 100644
  #include "common.h"
  
  #if XASH_SDLMAIN
-@@ -41,10 +43,98 @@ int main( int argc, char **argv )
+@@ -41,10 +43,116 @@ int main( int argc, char **argv )
  #elif XASH_IOS
  	IOS_LaunchDialog();
  	szArgc = IOS_GetArgs( &szArgv );
@@ -222,9 +280,12 @@ index 70adc33..77404ef 100644
 +	// flags above.
 +	{
 +		static char *ps5_argv[64];
-+		// -dev 2 / -console: debug builds mirror the whole console to klogsrv
 +		// -gl2shim: Core profile has no fixed-function GL; ref_gl's shim emulates it
-+		static const char *forced_args[] = { "-glcore", "-gl2shim", "-dev", "2", "-console" };
++		// -dev 2 (verbose developer output) only when /data/xash_debug.txt
++		// exists or the build defines XASH_PS5_DEBUG: release builds stay quiet
++		static const char *forced_args[] = { "-glcore", "-gl2shim", "-console" };
++		static const char *debug_args[] = { "-dev", "2" };
++		qboolean ps5_debug = false;
 +		int i, j;
 +
 +		// argv[0] must be the program name: Sys_CheckParm() scans from index 1.
@@ -237,6 +298,21 @@ index 70adc33..77404ef 100644
 +			ps5_argv[i++] = argv[j];
 +		for( j = 0; j < (int)( sizeof( forced_args ) / sizeof( forced_args[0] )); j++ )
 +			ps5_argv[i++] = (char *)forced_args[j];
++#if defined( XASH_PS5_DEBUG )
++		ps5_debug = true;
++#else
++		{
++			FILE *dbg = fopen( "/data/xash_debug.txt", "r" );
++			if( dbg )
++			{
++				fclose( dbg );
++				ps5_debug = true;
++			}
++		}
++#endif
++		if( ps5_debug )
++			for( j = 0; j < (int)( sizeof( debug_args ) / sizeof( debug_args[0] )); j++ )
++				ps5_argv[i++] = (char *)debug_args[j];
 +
 +		// Extra args from a writable file (no command line on PS5): lets us try
 +		// engine/renderer switches over FTP without rebuilding the eboot.
@@ -346,7 +422,7 @@ index d139dff..0de463c 100644
  	}
  
 diff --git a/engine/common/sys_con.c b/engine/common/sys_con.c
-index b4e5bb2..41a1ce8 100644
+index b4e5bb2..64ca30a 100644
 --- a/engine/common/sys_con.c
 +++ b/engine/common/sys_con.c
 @@ -22,6 +22,10 @@ GNU General Public License for more details.
@@ -360,7 +436,7 @@ index b4e5bb2..41a1ce8 100644
  #include "xash3d_mathlib.h"
  #if XASH_WIN32
  #include <io.h>
-@@ -277,6 +281,24 @@ static void Sys_PrintStdout( const char *logtime, size_t logtime_len, const char
+@@ -277,6 +281,29 @@ static void Sys_PrintStdout( const char *logtime, size_t logtime_len, const char
  	fprintf( stderr, "%s %s", logtime, stripped );
  #endif // XASH_NSWITCH && NSWITCH_DEBUG
  
@@ -376,7 +452,12 @@ index b4e5bb2..41a1ce8 100644
 +		Q_snprintf( line, sizeof( line ), "[XASH] %s", stripped );
 +		sceKernelDebugOutText( 0, line );
 +		if( ps5_log_fd == -2 )
++		{
++			// keep the previous run: after a crash the user relaunches before
++			// fetching the log, which would otherwise wipe the useful one
++			rename( "/data/xash_log.txt", "/data/xash_log_previous.txt" );
 +			ps5_log_fd = open( "/data/xash_log.txt", O_WRONLY | O_CREAT | O_TRUNC, 0666 );
++		}
 +		if( ps5_log_fd >= 0 )
 +			write( ps5_log_fd, stripped, Q_strlen( stripped ));
 +	}

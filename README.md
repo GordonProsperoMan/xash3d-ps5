@@ -102,14 +102,22 @@ which starts with `unbindall`).
 | System keyboard: `sceImeDialog*` never resolved through `sceKernelDlsym` | `sceCommonDialogInitialize` + `sceSysmoduleLoadModule(ImeDialog)` with regular imports, plus a link-only `libSceCommonDialog` stub (the public SDK lacks one), as in BlackBearReloaded's ProsperoTV |
 | `exit()` raises SIGSYS in a native title | *Quit* closes the app through `sceSystemServiceLoadExec("exit")` |
 | Several games in one title | Half-Life, Opposing Force and Blue Shift game code linked side by side; *Change game* relaunches the title with `-game <dir>` |
-| Logs | every console line mirrored to the kernel log (`sceKernelDebugOutText`) |
+| Logs | every console line mirrored to the kernel log (`sceKernelDebugOutText`) and to `/data/xash_log.txt`; the previous run is kept as `/data/xash_log_previous.txt`. Create `/data/xash_debug.txt` for verbose output (`-dev 2`, performance counters) |
+| Right-stick aim | circular deadzone + response curve instead of per-axis deadzones (`joy_aim_curve 1`), idea and tuning from mpereiraesaa/ps5-xash3d-halflife |
 
 ## Known limitations
 
 - Internet server browser untested; LAN works.
 - Counter-Strike: the `cstrike` folder launches, but its own game code is not
   included yet.
-- Debug logging (`-dev 2`, performance counters) is still enabled in this build.
+
+## Thanks
+
+- [BlackBearReloaded](https://github.com/blackbearreloaded): ps5-opengl,
+  ps5-native-app-boilerplate, and ProsperoTV (system keyboard sequence).
+- [mpereiraesaa/ps5-xash3d-halflife](https://github.com/mpereiraesaa/ps5-xash3d-halflife),
+  another native PS5 Xash3D port: right-stick aim curve and its tuning, and the
+  release allowlist check.
 
 ## License
 
